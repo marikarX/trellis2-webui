@@ -1,8 +1,19 @@
 import os
-os.environ['OPENCV_IO_ENABLE_OPENEXR'] = '1'
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-os.environ["ATTN_BACKEND"] = "sdpa"
-os.environ["SPARSE_ATTN_BACKEND"] = "sdpa"
+os.environ.setdefault('OPENCV_IO_ENABLE_OPENEXR', '1')
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+# Auto deliberately resolves to PyTorch SDPA. The fork's setup applies a small
+# sparse-attention adapter because upstream does not expose SDPA for VarLenTensor.
+_requested_attention = os.environ.get(
+    "TRELLIS_ATTENTION_BACKEND", os.environ.get("ATTN_BACKEND", "auto")
+).strip().lower()
+if _requested_attention == "auto":
+    _requested_attention = "sdpa"
+if _requested_attention not in {"sdpa", "flash_attn", "flash_attn_3", "xformers"}:
+    raise RuntimeError("TRELLIS_ATTENTION_BACKEND must be auto, sdpa, flash_attn, flash_attn_3, or xformers")
+ATTENTION_BACKEND = _requested_attention
+os.environ["ATTN_BACKEND"] = ATTENTION_BACKEND
+os.environ["SPARSE_ATTN_BACKEND"] = ATTENTION_BACKEND
 
 import asyncio
 import gc
@@ -15,7 +26,7 @@ import traceback
 import zipfile
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, List
+from typing import Any, Optional, List
 
 import cv2
 import numpy as np
@@ -29,11 +40,23 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from trellis2.modules.sparse import SparseTensor
 from trellis2.modules.sparse import config as sparse_config
-sparse_config.ATTN = 'sdpa'  # Force sdpa — flash_attn not installed
+sparse_config.ATTN = ATTENTION_BACKEND
 from trellis2.pipelines import Trellis2ImageTo3DPipeline, Trellis2TexturingPipeline
+from trellis2.pipelines import samplers as trellis_samplers
+from trellis2 import models as trellis_models
 from trellis2.renderers import EnvMap
 from trellis2.utils import render_utils
 import o_voxel
+from runtime_config import (
+    PROFILES,
+    VramMeter,
+    get_gpu_info,
+    is_cuda_oom,
+    oom_detail,
+    recommend_profile,
+    resolve_cpu_offload,
+    resolve_profile,
+)
 
 # ---------------------------------------------------------------------------
 # Config
@@ -53,6 +76,10 @@ MODEL_PATH = os.environ.get(
 # Use second GPU for mesh processing if available, otherwise same GPU
 GENERATION_DEVICE = "cuda:0"
 MESH_DEVICE = "cuda:1" if torch.cuda.device_count() > 1 else "cuda:0"
+GPU_INFO = get_gpu_info(torch)
+RECOMMENDED_PROFILE = recommend_profile(GPU_INFO.get("total_vram_gb"))
+DEFAULT_PROFILE_REQUEST = os.environ.get("TRELLIS_EXECUTION_PRESET", "auto")
+CPU_OFFLOAD_REQUEST = os.environ.get("TRELLIS_CPU_OFFLOAD", "auto")
 
 # Global pipeline references (initialized on startup)
 pipeline: Trellis2ImageTo3DPipeline = None  # type: ignore
@@ -69,75 +96,46 @@ progress_store: dict = {}  # task_id -> {stage, step, total, done}
 gpu_lock = asyncio.Lock()
 
 
-def move_pipeline_to(p, device):
-    """Deep inspection tool to safely move ALL models attached to a pipeline.
-    Handles nn.ModuleDict (which isinstance(dict) returns False for)."""
-    if p is None: return
-
-    p._device = device
-
-    if hasattr(p, 'to'):
-        try: p.to(device)
-        except Exception: pass
-
-    if hasattr(p, 'models'):
-        models = p.models
-        # Support for both standard dicts AND PyTorch nn.ModuleDict
-        if isinstance(models, dict) or hasattr(models, 'values'):
-            for m in models.values():
-                if hasattr(m, 'to'):
-                    try: m.to(device)
-                    except Exception: pass
-
-    # Sweep internal attributes for custom attached PyTorch modules
-    for attr_name in dir(p):
-        if attr_name.startswith('_'): continue
-        try:
-            val = getattr(p, attr_name)
-            if isinstance(val, torch.nn.Module):
-                if hasattr(val, 'to'):
-                    try: val.to(device)
-                    except Exception: pass
-        except Exception:
-            pass
-
-
-def offload_sampling_models():
-    """Offload flow models and conditioning model to CPU, keeping only decoders active."""
-    sampling_models = [
-        'sparse_structure_flow_model', 'shape_slat_flow_model_512',
-        'shape_slat_flow_model_1024', 'tex_slat_flow_model_512', 'tex_slat_flow_model_1024',
-    ]
-    for p in [pipeline, tex_pipeline]:
-        if p is None: continue
-        if hasattr(p, 'models') and (isinstance(p.models, dict) or hasattr(p.models, 'keys')):
-            for name in sampling_models:
-                if name in p.models:
-                    try: p.models[name].to('cpu')
-                    except Exception: pass
-        for attr in ['image_cond_model', 'rembg_model']:
-            if hasattr(p, attr):
-                m = getattr(p, attr)
-                if m is not None and hasattr(m, 'to'):
-                    try: m.to('cpu')
-                    except Exception: pass
-    gc.collect()
-    torch.cuda.empty_cache()
-
-
 def force_offload_all():
-    """Forces absolutely everything to CPU to give to_glb maximum VRAM."""
-    move_pipeline_to(pipeline, 'cpu')
-    move_pipeline_to(tex_pipeline, 'cpu')
+    """Release model and environment-map allocations at a stage boundary."""
+    cleanup_errors = []
+    for p in (pipeline, tex_pipeline):
+        if p is None:
+            continue
+        for name, model in getattr(p, "models", {}).items():
+            try:
+                model.to("cpu")
+            except Exception as exc:
+                cleanup_errors.append(f"{name}: {exc}")
+        for attr_name in ("image_cond_model", "rembg_model"):
+            component = getattr(p, attr_name, None)
+            if component is not None:
+                try:
+                    if hasattr(component, "to"):
+                        component.to("cpu")
+                    elif hasattr(component, "cpu"):
+                        component.cpu()
+                except Exception as exc:
+                    cleanup_errors.append(f"{attr_name}: {exc}")
+        p._device = "cpu"
 
     for v in envmap.values():
-        if hasattr(v, 'image') and hasattr(v.image, 'to'):
-            v.image = v.image.to('cpu')
-        if hasattr(v, '_nvdiffrec_envlight'):
-            delattr(v, '_nvdiffrec_envlight')
+        try:
+            if hasattr(v, 'image') and hasattr(v.image, 'to'):
+                v.image = v.image.to('cpu')
+            if hasattr(v, '_nvdiffrec_envlight'):
+                delattr(v, '_nvdiffrec_envlight')
+        except Exception as exc:
+            cleanup_errors.append(f"environment map: {exc}")
 
     gc.collect()
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+        except Exception as exc:
+            cleanup_errors.append(f"CUDA cache: {exc}")
+    if cleanup_errors:
+        print(f"[VRAM] Offload cleanup warnings: {'; '.join(cleanup_errors)}", flush=True)
 
 
 def restore_envmaps():
@@ -145,6 +143,52 @@ def restore_envmaps():
     for v in envmap.values():
         if hasattr(v, 'image') and hasattr(v.image, 'to'):
             v.image = v.image.to(GENERATION_DEVICE)
+
+
+def configure_pipeline_for_job(p, cpu_offload: bool) -> None:
+    """Set the pipeline's device policy before any stage starts."""
+    if p is None:
+        return
+    p.low_vram = cpu_offload
+    p._device = GENERATION_DEVICE
+    if not cpu_offload:
+        # This is the original high-memory path: all components stay resident.
+        p.to(GENERATION_DEVICE)
+
+
+def load_texturing_pipeline_shared():
+    """Load only the texturing encoder and reuse image-pipeline model weights.
+
+    The upstream texturing loader otherwise loads duplicate texture flow and
+    decoder weights into CPU RAM. The GPU lock ensures the shared module objects
+    are never used by both pipeline wrappers at once.
+    """
+    config_path = Path(MODEL_PATH) / "texturing_pipeline.json"
+    if config_path.exists():
+        texturing_config_path = config_path
+    else:
+        from huggingface_hub import hf_hub_download
+        texturing_config_path = Path(hf_hub_download(MODEL_PATH, "texturing_pipeline.json"))
+    args = json.loads(texturing_config_path.read_text(encoding="utf-8"))["args"]
+    shape_encoder_path = args["models"]["shape_slat_encoder"]
+    shape_encoder = trellis_models.from_pretrained(f"{MODEL_PATH}/{shape_encoder_path}")
+    models = {
+        "shape_slat_encoder": shape_encoder,
+        "tex_slat_decoder": pipeline.models["tex_slat_decoder"],
+        "tex_slat_flow_model_512": pipeline.models["tex_slat_flow_model_512"],
+        "tex_slat_flow_model_1024": pipeline.models["tex_slat_flow_model_1024"],
+    }
+    sampler_cfg = args["tex_slat_sampler"]
+    return Trellis2TexturingPipeline(
+        models=models,
+        tex_slat_sampler=getattr(trellis_samplers, sampler_cfg["name"])(**sampler_cfg["args"]),
+        tex_slat_sampler_params=args["tex_slat_sampler"]["params"],
+        shape_slat_normalization=args["shape_slat_normalization"],
+        tex_slat_normalization=args["tex_slat_normalization"],
+        image_cond_model=pipeline.image_cond_model,
+        rembg_model=pipeline.rembg_model,
+        low_vram=True,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -209,19 +253,9 @@ async def startup():
 
     print(f"Loading model from: {MODEL_PATH}")
     pipeline = Trellis2ImageTo3DPipeline.from_pretrained(MODEL_PATH)
-    move_pipeline_to(pipeline, GENERATION_DEVICE)
+    pipeline.low_vram = True
+    tex_pipeline = None  # Construct lazily and share the texture models on first use.
     force_offload_all()
-
-    try:
-        tex_pipeline = Trellis2TexturingPipeline.from_pretrained(
-            MODEL_PATH, config_file="texturing_pipeline.json"
-        )
-        move_pipeline_to(tex_pipeline, GENERATION_DEVICE)
-        force_offload_all()
-    except Exception as e:
-        print(f"⚠ Texturing pipeline not available: {e}")
-        traceback.print_exc()
-        tex_pipeline = None
 
     envmap_data = {}
     hdri_dir = ASSETS_DIR / "hdri"
@@ -230,14 +264,20 @@ async def startup():
         if exr_path.exists():
             envmap_data[name] = EnvMap(torch.tensor(
                 cv2.cvtColor(cv2.imread(str(exr_path), cv2.IMREAD_UNCHANGED), cv2.COLOR_BGR2RGB),
-                dtype=torch.float32, device='cuda'
+                dtype=torch.float32, device='cpu'
             ))
     envmap = envmap_data
     force_offload_all()
 
     print(f"✅ TRELLIS.2 WebUI ready")
-    print(f"   Generation on: {GENERATION_DEVICE} ({torch.cuda.get_device_name(GENERATION_DEVICE)})")
-    if torch.cuda.device_count() > 1:
+    if GPU_INFO.get("cuda_available"):
+        print(f"   GPU: {GPU_INFO['gpu_name']} ({GPU_INFO['total_vram_gb']:.1f} GB VRAM)")
+        print(f"   Recommended preset: {PROFILES[RECOMMENDED_PROFILE].label}")
+        print(f"   CUDA BF16: {'supported' if GPU_INFO['bf16_supported'] else 'not reported'}")
+    else:
+        print("   CUDA unavailable; generation will report a runtime error if requested.")
+    print(f"   Attention backend: {ATTENTION_BACKEND}; checkpoint precision is preserved")
+    if torch.cuda.is_available() and torch.cuda.device_count() > 1:
         print(f"   Mesh export on: {MESH_DEVICE} ({torch.cuda.get_device_name(MESH_DEVICE)})")
 
 
@@ -263,6 +303,372 @@ async def progress_stream(task_id: str):
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
+@app.get("/api/runtime")
+async def runtime_info():
+    """Hardware and safe-default information shown in the WebUI."""
+    current_gpu_info = get_gpu_info(torch)
+    recommended_profile = recommend_profile(current_gpu_info.get("total_vram_gb"))
+    warnings = []
+    try:
+        profile = resolve_profile(DEFAULT_PROFILE_REQUEST, current_gpu_info)
+    except ValueError as exc:
+        profile = resolve_profile("auto", current_gpu_info)
+        warnings.append(f"Invalid TRELLIS_EXECUTION_PRESET was ignored: {exc}")
+    try:
+        offload = resolve_cpu_offload(CPU_OFFLOAD_REQUEST, profile, current_gpu_info.get("total_vram_gb"))
+    except ValueError as exc:
+        offload = True
+        warnings.append(f"Invalid TRELLIS_CPU_OFFLOAD was ignored: {exc}")
+    total_vram = current_gpu_info.get("total_vram_gb")
+    if total_vram is not None and total_vram < 12:
+        warnings.append("Below 12 GB VRAM is experimental; the application will still launch.")
+    if total_vram is not None and total_vram < 24:
+        warnings.append("16 GB inference has not been benchmarked in this checkout; 512 is the conservative default.")
+    return {
+        **current_gpu_info,
+        "recommended_preset": recommended_profile,
+        "default_preset": profile.key,
+        "default_geometry_resolution": profile.resolution,
+        "cpu_offload": offload,
+        "attention_backend": "Auto (PyTorch SDPA)" if ATTENTION_BACKEND == "sdpa" else ATTENTION_BACKEND,
+        "precision": "Checkpoint-defined (upstream TRELLIS.2 4B uses BF16 flow weights and FP16 decoders)",
+        "warnings": warnings,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Generation runtime shared by single-image and multi-view routes
+# ---------------------------------------------------------------------------
+class GenerationOOMError(RuntimeError):
+    pass
+
+
+def _condition_to_device(condition: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    return {key: value.to(GENERATION_DEVICE) for key, value in condition.items()}
+
+
+def _empty_cuda_cache():
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def run_generation(
+    input_images: list[Image.Image],
+    view_labels: list[str],
+    task_id: str,
+    seed: int,
+    profile,
+    resolution: str,
+    ss_params: dict[str, Any],
+    shape_params: dict[str, Any],
+    tex_params: dict[str, Any],
+) -> tuple[dict, dict, float | None, list[dict[str, Any]]]:
+    """Run explicit TRELLIS.2 stages so their model/tensor lifetimes are visible."""
+    global pipeline
+    offload = resolve_cpu_offload(CPU_OFFLOAD_REQUEST, profile, GPU_INFO.get("total_vram_gb"))
+    pipeline_type = {"512": "512", "1024": "1024_cascade", "1536": "1536_cascade"}.get(resolution)
+    if pipeline_type is None:
+        raise ValueError("Resolution must be 512, 1024, or 1536.")
+
+    meter = VramMeter(torch, GENERATION_DEVICE)
+    stage_open = False
+    cond_512_cpu = cond_1024_cpu = None
+    cond_512_gpu = cond_1024_gpu = tex_cond_gpu = None
+    processed_images = encoded_views = condition_cpu = None
+    image_model = features = combined = tex_cond_cpu = None
+    coords = shape_slat = tex_slat = None
+    meshes = subs = tex_voxels = out_mesh = mesh = None
+    shape_mesh = voxel = None
+    state = previews = None
+
+    def begin_stage(stage: str, step: int):
+        nonlocal stage_open
+        meter.begin(stage)
+        stage_open = True
+        progress_store[task_id] = {"stage": stage, "step": step, "total": 100, "done": False}
+
+    def end_stage():
+        nonlocal stage_open
+        meter.end()
+        stage_open = False
+
+    try:
+        begin_stage("Staging inference models", 2)
+        force_offload_all()
+        configure_pipeline_for_job(pipeline, offload)
+        end_stage()
+        torch.manual_seed(seed)
+
+        with torch.no_grad():
+            begin_stage("Preprocessing reference images", 5)
+            processed_images = [pipeline.preprocess_image(image) for image in input_images]
+            end_stage()
+
+            # DINOv3 is moved to CUDA once per resolution. Each view is encoded
+            # individually and immediately copied to CPU before the next view.
+            # Concatenating patch tokens retains all views in the model's existing
+            # cross-attention input; this is a fork-side adaptation, not upstream
+            # camera-aware multi-view conditioning.
+            needed_resolutions = [512] if pipeline_type == "512" else [512, 1024]
+            condition_cpu = {}
+            for cond_resolution in needed_resolutions:
+                begin_stage(f"Conditioning {cond_resolution} ({len(processed_images)} views, sequential)", 14)
+                image_model = pipeline.image_cond_model
+                if hasattr(image_model, "image_size"):
+                    image_model.image_size = cond_resolution
+                if offload:
+                    image_model.to(GENERATION_DEVICE)
+                encoded_views = []
+                try:
+                    for view_index, image in enumerate(processed_images):
+                        features = image_model([image])
+                        if features.ndim != 3 or features.shape[0] != 1:
+                            raise RuntimeError(f"Expected one feature batch for view {view_index + 1}, got {tuple(features.shape)}")
+                        encoded_views.append(features[0].detach().to("cpu"))
+                        del features
+                    combined = torch.cat(encoded_views, dim=0).unsqueeze(0)
+                    condition_cpu[cond_resolution] = {
+                        "cond": combined,
+                        "neg_cond": torch.zeros_like(combined),
+                    }
+                    del combined
+                finally:
+                    if offload:
+                        image_model.to("cpu")
+                    encoded_views = None
+                end_stage()
+            cond_512_cpu = condition_cpu.pop(512)
+            cond_1024_cpu = condition_cpu.pop(1024) if 1024 in condition_cpu else None
+            del condition_cpu, processed_images
+            processed_images = None
+            _empty_cuda_cache()
+
+            begin_stage("Sparse structure sampling", 26)
+            cond_512_gpu = _condition_to_device(cond_512_cpu)
+            sparse_resolution = {"512": 32, "1024": 64, "1024_cascade": 32, "1536_cascade": 32}[pipeline_type]
+            coords = pipeline.sample_sparse_structure(cond_512_gpu, sparse_resolution, 1, ss_params)
+            cond_512_gpu = None
+            end_stage()
+            if offload:
+                _empty_cuda_cache()
+
+            begin_stage("Shape generation", 40)
+            if pipeline_type == "512":
+                cond_512_gpu = _condition_to_device(cond_512_cpu)
+                shape_slat = pipeline.sample_shape_slat(
+                    cond_512_gpu, pipeline.models["shape_slat_flow_model_512"], coords, shape_params
+                )
+                output_resolution = 512
+            elif pipeline_type == "1024":
+                cond_1024_gpu = _condition_to_device(cond_1024_cpu)
+                shape_slat = pipeline.sample_shape_slat(
+                    cond_1024_gpu, pipeline.models["shape_slat_flow_model_1024"], coords, shape_params
+                )
+                output_resolution = 1024
+            else:
+                cond_512_gpu = _condition_to_device(cond_512_cpu)
+                cond_1024_gpu = _condition_to_device(cond_1024_cpu)
+                cascade_resolution = 1024 if pipeline_type == "1024_cascade" else 1536
+                shape_slat, output_resolution = pipeline.sample_shape_slat_cascade(
+                    cond_512_gpu,
+                    cond_1024_gpu,
+                    pipeline.models["shape_slat_flow_model_512"],
+                    pipeline.models["shape_slat_flow_model_1024"],
+                    512,
+                    cascade_resolution,
+                    coords,
+                    shape_params,
+                )
+            cond_512_gpu = cond_1024_gpu = None
+            coords = None
+            del coords
+            end_stage()
+            if offload:
+                _empty_cuda_cache()
+
+            begin_stage("Material generation", 61)
+            use_512_material_model = pipeline_type == "512"
+            tex_cond_cpu = cond_512_cpu if use_512_material_model else cond_1024_cpu
+            tex_cond_gpu = _condition_to_device(tex_cond_cpu)
+            tex_model_name = "tex_slat_flow_model_512" if use_512_material_model else "tex_slat_flow_model_1024"
+            tex_slat = pipeline.sample_tex_slat(
+                tex_cond_gpu, pipeline.models[tex_model_name], shape_slat, tex_params
+            )
+            tex_cond_gpu = None
+            cond_512_cpu = cond_1024_cpu = None
+            del cond_512_cpu, cond_1024_cpu
+            if offload:
+                # Keep the sampled material latent in system RAM while the
+                # geometry decoder runs; it is only needed again for texture decode.
+                tex_slat.clear_spatial_cache()
+                tex_slat = tex_slat.cpu()
+            end_stage()
+            if offload:
+                _empty_cuda_cache()
+
+            # Decode shape first, release its latent, then decode materials.
+            # The only duplicated glue below mirrors upstream decode_latent().
+            begin_stage("Decoding geometry and PBR voxels", 75)
+            meshes, subs = pipeline.decode_shape_slat(shape_slat, output_resolution)
+            shape_slat = None
+            del shape_slat
+            if offload:
+                _empty_cuda_cache()
+                tex_slat = tex_slat.to(GENERATION_DEVICE)
+            tex_voxels = pipeline.decode_tex_slat(tex_slat, subs)
+            tex_slat = None
+            subs = None
+            del tex_slat, subs
+            if offload:
+                _empty_cuda_cache()
+            from trellis2.representations import MeshWithVoxel
+            out_mesh = []
+            for shape_mesh, voxel in zip(meshes, tex_voxels):
+                shape_mesh.fill_holes()
+                out_mesh.append(MeshWithVoxel(
+                    shape_mesh.vertices,
+                    shape_mesh.faces,
+                    origin=[-0.5, -0.5, -0.5],
+                    voxel_size=1 / output_resolution,
+                    coords=voxel.coords[:, 1:],
+                    attrs=voxel.feats,
+                    voxel_shape=torch.Size([*voxel.shape, *voxel.spatial_shape]),
+                    layout=pipeline.pbr_attr_layout,
+                ))
+            meshes = tex_voxels = None
+            del meshes, tex_voxels
+            mesh = out_mesh[0]
+            end_stage()
+            if offload:
+                _empty_cuda_cache()
+
+            begin_stage("Rendering preview", 88)
+            restore_envmaps()
+            previews = render_preview_images(mesh, envmap)
+            end_stage()
+
+            begin_stage("Copying export state to CPU", 96)
+            state = {
+                "verts": mesh.vertices.detach().cpu().clone(),
+                "faces": mesh.faces.detach().cpu().clone(),
+                "attrs": mesh.attrs.detach().cpu().clone(),
+                "coords": mesh.coords.detach().cpu().clone(),
+                "pbr_layout": pipeline.pbr_attr_layout,
+                "res": output_resolution,
+                "view_labels": list(view_labels),
+                "preset": profile.key,
+            }
+            end_stage()
+
+        generation_peak = meter.peak_gb
+        records = list(meter.records)
+        progress_store[task_id].update({
+            "peak_vram_gb": generation_peak,
+            "vram_stages": records,
+        })
+        return previews, state, generation_peak, records
+    except Exception as exc:
+        if is_cuda_oom(exc, torch):
+            if stage_open:
+                try:
+                    end_stage()
+                except Exception:
+                    pass
+            stage = meter.stage
+            detail = oom_detail(stage, meter.peak_gb, profile, resolution)
+            # Drop the original traceback before its tensor-bearing frames can
+            # keep failed-stage allocations reachable during cleanup.
+            try:
+                exc.__traceback__ = None
+                exc.__context__ = None
+            except Exception:
+                pass
+            raise GenerationOOMError(detail) from None
+        raise
+    finally:
+        cond_512_cpu = cond_1024_cpu = None
+        cond_512_gpu = cond_1024_gpu = tex_cond_gpu = None
+        processed_images = encoded_views = condition_cpu = None
+        image_model = features = combined = tex_cond_cpu = None
+        coords = shape_slat = tex_slat = None
+        meshes = subs = tex_voxels = out_mesh = mesh = None
+        shape_mesh = voxel = None
+        state = previews = None
+        try:
+            force_offload_all()
+        except Exception as cleanup_error:
+            print(f"[VRAM] Cleanup warning: {cleanup_error}", flush=True)
+        _empty_cuda_cache()
+
+
+def _generation_params(
+    ss_guidance_strength, ss_guidance_rescale, ss_sampling_steps, ss_rescale_t,
+    shape_guidance_strength, shape_guidance_rescale, shape_sampling_steps, shape_rescale_t,
+    tex_guidance_strength, tex_guidance_rescale, tex_sampling_steps, tex_rescale_t,
+):
+    return (
+        {"steps": ss_sampling_steps, "guidance_strength": ss_guidance_strength, "guidance_rescale": ss_guidance_rescale, "rescale_t": ss_rescale_t},
+        {"steps": shape_sampling_steps, "guidance_strength": shape_guidance_strength, "guidance_rescale": shape_guidance_rescale, "rescale_t": shape_rescale_t},
+        {"steps": tex_sampling_steps, "guidance_strength": tex_guidance_strength, "guidance_rescale": tex_guidance_rescale, "rescale_t": tex_rescale_t},
+    )
+
+
+def _profile_and_resolution(preset_key: str, requested_resolution: str):
+    profile = resolve_profile(preset_key or DEFAULT_PROFILE_REQUEST, GPU_INFO)
+    resolution = str(requested_resolution or profile.resolution)
+    if resolution not in {"512", "1024", "1536"}:
+        raise HTTPException(status_code=422, detail="Resolution must be 512, 1024, or 1536.")
+    warning = profile.warning
+    total_vram = GPU_INFO.get("total_vram_gb")
+    if total_vram is not None and total_vram < 24 and resolution != "512":
+        warning = f"{resolution} resolution is experimental on this {total_vram:.1f} GB GPU and may run out of memory."
+    elif resolution != profile.resolution:
+        warning = f"Resolution {resolution} overrides the {profile.label} default ({profile.resolution})."
+    return profile, resolution, warning
+
+
+async def _start_generation(images, labels, task_id, seed, profile, resolution, params):
+    progress_store[task_id] = {"stage": "Starting", "step": 0, "total": 100, "done": False}
+    async with gpu_lock:
+        try:
+            result = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: run_generation(images, labels, task_id, seed, profile, resolution, *params),
+            )
+            previews, export_state, peak_vram_gb, vram_stages = result
+            session_id = str(uuid.uuid4())
+            latent_store[session_id] = export_state
+            progress_store[task_id] = {
+                "stage": "Done", "step": 100, "total": 100, "done": True,
+                "peak_vram_gb": peak_vram_gb, "vram_stages": vram_stages,
+            }
+            return JSONResponse({
+                "task_id": task_id,
+                "session_id": session_id,
+                "seed": seed,
+                "previews": previews,
+                "num_views": len(images),
+                "view_labels": labels,
+                "preset": profile.key,
+                "resolution": export_state["res"],
+                "peak_vram_gb": peak_vram_gb,
+                "vram_stages": vram_stages,
+                "warning": _profile_and_resolution(profile.key, resolution)[2],
+            })
+        except GenerationOOMError as exc:
+            progress_store[task_id] = {"stage": f"Error: {exc}", "step": 0, "total": 100, "done": True}
+            raise HTTPException(status_code=500, detail=str(exc)) from None
+        except Exception as exc:
+            progress_store[task_id] = {"stage": f"Error: {exc}", "step": 0, "total": 100, "done": True}
+            traceback.print_exc()
+            try:
+                force_offload_all()
+            finally:
+                _empty_cuda_cache()
+            raise HTTPException(status_code=500, detail=str(exc)) from None
+
+
 # ---------------------------------------------------------------------------
 # API: Single Image → 3D
 # ---------------------------------------------------------------------------
@@ -271,7 +677,8 @@ async def generate(
     image: UploadFile = File(...),
     seed: int = Form(0),
     randomize_seed: bool = Form(True),
-    resolution: str = Form("1024"),
+    resolution: str = Form(""),
+    execution_preset: str = Form(""),
     task_id: str = Form(""),
     ss_guidance_strength: float = Form(7.5),
     ss_guidance_rescale: float = Form(0.7),
@@ -287,112 +694,19 @@ async def generate(
     tex_rescale_t: float = Form(3.0),
 ):
     task_id = task_id.strip() or str(uuid.uuid4())
-    session_id = str(uuid.uuid4())
-
     if randomize_seed:
         seed = int(np.random.randint(0, MAX_SEED))
-
-    pil_image = load_pil_image(image)
-    pil_image = pipeline.preprocess_image(pil_image)
-    pipeline_type = {"512": "512", "1024": "1024_cascade", "1536": "1536_cascade"}.get(resolution, "1024_cascade")
-
-    progress_store[task_id] = {"stage": "Starting", "step": 0, "total": 100, "done": False}
-
-    async with gpu_lock:
-        try:
-            progress_store[task_id] = {"stage": "Conditioning image", "step": 10, "total": 100, "done": False}
-
-            ss_params = {"steps": ss_sampling_steps, "guidance_strength": ss_guidance_strength, "guidance_rescale": ss_guidance_rescale, "rescale_t": ss_rescale_t}
-            shape_params = {"steps": shape_sampling_steps, "guidance_strength": shape_guidance_strength, "guidance_rescale": shape_guidance_rescale, "rescale_t": shape_rescale_t}
-            tex_params = {"steps": tex_sampling_steps, "guidance_strength": tex_guidance_strength, "guidance_rescale": tex_guidance_rescale, "rescale_t": tex_rescale_t}
-
-            def do_generation():
-                import torch as _torch
-                import gc
-                _torch.manual_seed(seed)
-
-                with _torch.no_grad():
-                    force_offload_all()
-                    # Let low_vram mode handle per-model loading — do NOT bulk-load
-                    pipeline._device = GENERATION_DEVICE
-
-                    cond_512 = pipeline.get_cond([pil_image], 512)
-                    cond_1024 = pipeline.get_cond([pil_image], 1024) if pipeline_type != '512' else None
-
-                    progress_store[task_id] = {"stage": "Sparse structure", "step": 20, "total": 100, "done": False}
-                    ss_res = {'512': 32, '1024': 64, '1024_cascade': 32, '1536_cascade': 32}[pipeline_type]
-                    coords = pipeline.sample_sparse_structure(cond_512, ss_res, 1, ss_params)
-
-                    progress_store[task_id] = {"stage": "Generating shape", "step": 30, "total": 100, "done": False}
-                    if pipeline_type == '512':
-                        shape_slat = pipeline.sample_shape_slat(cond_512, pipeline.models['shape_slat_flow_model_512'], coords, shape_params)
-                        res = 512
-                    elif pipeline_type == '1024':
-                        shape_slat = pipeline.sample_shape_slat(cond_1024, pipeline.models['shape_slat_flow_model_1024'], coords, shape_params)
-                        res = 1024
-                    elif pipeline_type == '1024_cascade':
-                        shape_slat, res = pipeline.sample_shape_slat_cascade(cond_512, cond_1024, pipeline.models['shape_slat_flow_model_512'], pipeline.models['shape_slat_flow_model_1024'], 512, 1024, coords, shape_params)
-                    elif pipeline_type == '1536_cascade':
-                        shape_slat, res = pipeline.sample_shape_slat_cascade(cond_512, cond_1024, pipeline.models['shape_slat_flow_model_512'], pipeline.models['shape_slat_flow_model_1024'], 512, 1536, coords, shape_params)
-
-                    progress_store[task_id] = {"stage": "Generating texture", "step": 55, "total": 100, "done": False}
-                    tex_cond = cond_512 if pipeline_type == '512' else cond_1024
-                    tex_model = pipeline.models['tex_slat_flow_model_512'] if pipeline_type == '512' else pipeline.models['tex_slat_flow_model_1024']
-                    tex_slat = pipeline.sample_tex_slat(tex_cond, tex_model, shape_slat, tex_params)
-
-                    # Free ALL sampling models + intermediate tensors before decode
-                    del cond_512, cond_1024, tex_cond, coords
-                    force_offload_all()
-                    pipeline._device = GENERATION_DEVICE
-
-                    progress_store[task_id] = {"stage": "Decoding mesh", "step": 75, "total": 100, "done": False}
-                    out_mesh = pipeline.decode_latent(shape_slat, tex_slat, res)
-                    mesh = out_mesh[0]
-                    
-                    # Free the enormous slat tensors BEFORE rendering previews
-                    del shape_slat, tex_slat
-                    gc.collect()
-                    _torch.cuda.empty_cache()
-
-                    progress_store[task_id] = {"stage": "Rendering preview", "step": 80, "total": 100, "done": False}
-                    restore_envmaps()
-                    previews = render_preview_images(mesh, envmap)
-
-                    # ✅ Extract fully decoded raw tensors right here!
-                    # The decoder is bypassed entirely in /extract endpoints.
-                    state = {
-                        'verts': mesh.vertices.detach().cpu().clone(),
-                        'faces': mesh.faces.detach().cpu().clone(),
-                        'attrs': mesh.attrs.detach().cpu().clone(),
-                        'coords': mesh.coords.detach().cpu().clone(),
-                        'pbr_layout': pipeline.pbr_attr_layout,
-                        'res': res,
-                    }
-
-                    del out_mesh, mesh
-                    gc.collect()
-                    _torch.cuda.empty_cache()
-
-                force_offload_all()
-                return previews, state
-
-            previews, state = await asyncio.get_event_loop().run_in_executor(None, do_generation)
-            latent_store[session_id] = state
-
-            progress_store[task_id] = {"stage": "Done", "step": 100, "total": 100, "done": True}
-
-            return JSONResponse({
-                "task_id": task_id,
-                "session_id": session_id,
-                "seed": seed,
-                "previews": previews,
-            })
-
-        except Exception as e:
-            progress_store[task_id] = {"stage": f"Error: {str(e)}", "step": 0, "total": 100, "done": True}
-            traceback.print_exc()
-            force_offload_all()
-            raise HTTPException(status_code=500, detail=str(e))
+    try:
+        profile, resolution, _warning = _profile_and_resolution(execution_preset, resolution)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    image_pil = load_pil_image(image)
+    params = _generation_params(
+        ss_guidance_strength, ss_guidance_rescale, ss_sampling_steps, ss_rescale_t,
+        shape_guidance_strength, shape_guidance_rescale, shape_sampling_steps, shape_rescale_t,
+        tex_guidance_strength, tex_guidance_rescale, tex_sampling_steps, tex_rescale_t,
+    )
+    return await _start_generation([image_pil], ["Front"], task_id, seed, profile, resolution, params)
 
 
 # ---------------------------------------------------------------------------
@@ -403,7 +717,8 @@ async def generate_multiview(
     request: Request,
     seed: int = Form(0),
     randomize_seed: bool = Form(True),
-    resolution: str = Form("1024"),
+    resolution: str = Form(""),
+    execution_preset: str = Form(""),
     task_id: str = Form(""),
     ss_guidance_strength: float = Form(7.5),
     ss_guidance_rescale: float = Form(0.7),
@@ -419,84 +734,51 @@ async def generate_multiview(
     tex_rescale_t: float = Form(3.0),
 ):
     task_id = task_id.strip() or str(uuid.uuid4())
-    session_id = str(uuid.uuid4())
-
     if randomize_seed:
         seed = int(np.random.randint(0, MAX_SEED))
 
     form = await request.form()
-    image_files = []
+    indexed_uploads = []
+    labels_by_index: dict[int, str] = {}
     for key, value in form.multi_items():
-        if key.startswith("image"):
-            data = await value.read()
-            pil = Image.open(io.BytesIO(data)).convert("RGBA")
-            pil = pipeline.preprocess_image(pil)
-            image_files.append(pil)
+        if key.startswith("view_label_"):
+            try:
+                labels_by_index[int(key.rsplit("_", 1)[1])] = str(value)
+            except ValueError:
+                continue
+        elif key.startswith("image_") and hasattr(value, "read") and getattr(value, "filename", None):
+            try:
+                index = int(key.rsplit("_", 1)[1])
+            except ValueError:
+                continue
+            indexed_uploads.append((index, value))
+    indexed_uploads.sort(key=lambda row: row[0])
+    if not 2 <= len(indexed_uploads) <= 6:
+        raise HTTPException(status_code=422, detail="Multi-view generation requires 2 to 6 images.")
 
-    pipeline_type = {"512": "512", "1024": "1024_cascade", "1536": "1536_cascade"}.get(resolution, "1024_cascade")
-    progress_store[task_id] = {"stage": "Starting", "step": 0, "total": 100, "done": False}
+    images, labels = [], []
+    for index, upload in indexed_uploads:
+        data = await upload.read()
+        images.append(Image.open(io.BytesIO(data)).convert("RGBA"))
+        label = labels_by_index.get(index, "Custom").strip()
+        labels.append(label or "Custom")
+    try:
+        profile, resolution, _warning = _profile_and_resolution(execution_preset, resolution)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    params = _generation_params(
+        ss_guidance_strength, ss_guidance_rescale, ss_sampling_steps, ss_rescale_t,
+        shape_guidance_strength, shape_guidance_rescale, shape_sampling_steps, shape_rescale_t,
+        tex_guidance_strength, tex_guidance_rescale, tex_sampling_steps, tex_rescale_t,
+    )
+    # View labels are returned/stored for organization only. TRELLIS.2's released
+    # image-conditioning model consumes image tokens and does not consume camera labels.
+    return await _start_generation(images, labels, task_id, seed, profile, resolution, params)
 
-    async with gpu_lock:
-        try:
-            progress_store[task_id] = {"stage": "Generating 3D (multi-view)", "step": 10, "total": 100, "done": False}
 
-            def do_multiview():
-                import torch as _torch
-                import gc
-                with _torch.no_grad():
-                    force_offload_all()
-                    # Let low_vram mode handle per-model loading — do NOT bulk-load
-                    pipeline._device = GENERATION_DEVICE
-
-                    outputs, latents = pipeline.run_multiview(
-                        image_files, seed=seed, preprocess_image=False,
-                        sparse_structure_sampler_params={"steps": ss_sampling_steps, "guidance_strength": ss_guidance_strength, "guidance_rescale": ss_guidance_rescale, "rescale_t": ss_rescale_t},
-                        shape_slat_sampler_params={"steps": shape_sampling_steps, "guidance_strength": shape_guidance_strength, "guidance_rescale": shape_guidance_rescale, "rescale_t": shape_rescale_t},
-                        tex_slat_sampler_params={"steps": tex_sampling_steps, "guidance_strength": tex_guidance_strength, "guidance_rescale": tex_guidance_rescale, "rescale_t": tex_rescale_t},
-                        pipeline_type=pipeline_type, return_latent=True,
-                    )
-
-                    res = latents[2]
-                    del latents
-                    gc.collect()
-                    _torch.cuda.empty_cache()
-
-                    progress_store[task_id] = {"stage": "Rendering preview", "step": 80, "total": 100, "done": False}
-                    mesh = outputs[0]
-                    restore_envmaps()
-                    previews = render_preview_images(mesh, envmap)
-
-                    # ✅ Extract fully decoded raw tensors here!
-                    state = {
-                        'verts': mesh.vertices.detach().cpu().clone(),
-                        'faces': mesh.faces.detach().cpu().clone(),
-                        'attrs': mesh.attrs.detach().cpu().clone(),
-                        'coords': mesh.coords.detach().cpu().clone(),
-                        'pbr_layout': pipeline.pbr_attr_layout,
-                        'res': res,
-                    }
-
-                    del outputs, mesh
-                    gc.collect()
-                    _torch.cuda.empty_cache()
-
-                force_offload_all()
-                return previews, state
-
-            previews, state = await asyncio.get_event_loop().run_in_executor(None, do_multiview)
-            latent_store[session_id] = state
-
-            progress_store[task_id] = {"stage": "Done", "step": 100, "total": 100, "done": True}
-
-            return JSONResponse({
-                "task_id": task_id, "session_id": session_id, "seed": seed, "previews": previews, "num_views": len(image_files)
-            })
-
-        except Exception as e:
-            progress_store[task_id] = {"stage": f"Error: {str(e)}", "step": 0, "total": 100, "done": True}
-            traceback.print_exc()
-            force_offload_all()
-            raise HTTPException(status_code=500, detail=str(e))
+# ---------------------------------------------------------------------------
+# API: Extract GLB
+# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
@@ -513,6 +795,8 @@ async def extract_glb(
 
     state = latent_store[session_id]
     session_dir = get_session_dir(session_id)
+    meter = VramMeter(torch, MESH_DEVICE)
+    profile = resolve_profile(state.get("preset", DEFAULT_PROFILE_REQUEST), GPU_INFO)
 
     async with gpu_lock:
         try:
@@ -520,14 +804,15 @@ async def extract_glb(
                 import torch
                 import gc
 
-                # Purge absolutely everything to guarantee 31GB is available for to_glb
+                # Model weights stay on CPU while the PBR mesh is unwrapped and baked.
                 with torch.no_grad():
                     force_offload_all()
 
                 dev = MESH_DEVICE
                 with torch.no_grad(), torch.cuda.device(dev):
+                    meter.begin("GLB export: remesh and PBR bake")
                     allocated = torch.cuda.memory_allocated(dev) / 1e9
-                    print(f"\n[MEMORY] Before to_glb on {dev}: {allocated:.2f} GB allocated.")
+                    print(f"\n[GLB] Before export on {dev}: {allocated:.2f} GB allocated.")
 
                     verts = state['verts'].to(dev)
                     faces = state['faces'].to(dev)
@@ -543,8 +828,10 @@ async def extract_glb(
                             decimation_target=decimation_target, texture_size=texture_size,
                             remesh=True, remesh_band=1, remesh_project=0, use_tqdm=True,
                         )
+                        meter.end()
                     except Exception as e:
-                        if "out of memory" in str(e).lower() or "oom" in str(e).lower() or "allocate" in str(e).lower():
+                        if is_cuda_oom(e, torch):
+                            meter.end()
                             print(f"⚠ OOM detected in to_glb with remesh=True! Retrying with remesh=False (Fallback Mode)...")
                             # Wipe the failed tensors and free memory
                             del verts, faces, attrs, coords
@@ -558,12 +845,14 @@ async def extract_glb(
                             coords = state['coords'].to(dev)
 
                             # Retry without the memory-intensive cumesh remeshing pass
+                            meter.begin("GLB export fallback: no remesh")
                             glb = o_voxel.postprocess.to_glb(
                                 vertices=verts, faces=faces, attr_volume=attrs, coords=coords,
                                 attr_layout=state['pbr_layout'], grid_size=state['res'], aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
                                 decimation_target=decimation_target, texture_size=texture_size,
                                 remesh=False, use_tqdm=True,
                             )
+                            meter.end()
                         else:
                             raise e
 
@@ -577,17 +866,27 @@ async def extract_glb(
 
                 del glb
                 gc.collect()
-                return str(glb_path)
+                return str(glb_path), meter.peak_gb
 
-            glb_path = await asyncio.get_event_loop().run_in_executor(None, do_export)
-            restore_envmaps()
+            glb_path, peak_gb = await asyncio.get_event_loop().run_in_executor(None, do_export)
 
-            return FileResponse(glb_path, media_type="model/gltf-binary", filename=Path(glb_path).name)
+            headers = {"X-Trellis-Peak-VRAM-GB": f"{peak_gb:.3f}"} if peak_gb is not None else {}
+            return FileResponse(glb_path, media_type="model/gltf-binary", filename=Path(glb_path).name, headers=headers)
 
         except Exception as e:
-            force_offload_all()
+            try:
+                force_offload_all()
+            finally:
+                _empty_cuda_cache()
+            if is_cuda_oom(e, torch):
+                try:
+                    meter.end()
+                except Exception:
+                    pass
+                detail = oom_detail(meter.stage, meter.peak_gb, profile, state.get("res"))
+                raise HTTPException(status_code=500, detail=detail) from None
             traceback.print_exc()
-            raise HTTPException(status_code=500, detail=str(e))
+            raise HTTPException(status_code=500, detail=str(e)) from None
 
 
 # ---------------------------------------------------------------------------
@@ -607,6 +906,8 @@ async def extract_obj(
 
     state = latent_store[session_id]
     session_dir = get_session_dir(session_id)
+    meter = VramMeter(torch, MESH_DEVICE)
+    profile = resolve_profile(state.get("preset", DEFAULT_PROFILE_REQUEST), GPU_INFO)
 
     async with gpu_lock:
         try:
@@ -614,14 +915,15 @@ async def extract_obj(
                 import torch
                 import gc
 
-                # Purge absolutely everything to guarantee 31GB is available for to_glb
+                # Keep inference networks off CUDA while UVs and PBR maps are baked.
                 with torch.no_grad():
                     force_offload_all()
 
                 dev = MESH_DEVICE
                 with torch.no_grad(), torch.cuda.device(dev):
+                    meter.begin("OBJ export: remesh and PBR bake")
                     allocated = torch.cuda.memory_allocated(dev) / 1e9
-                    print(f"\n[MEMORY] Before to_glb on {dev}: {allocated:.2f} GB allocated.")
+                    print(f"\n[OBJ] Before export on {dev}: {allocated:.2f} GB allocated.")
 
                     verts = state['verts'].to(dev)
                     faces = state['faces'].to(dev)
@@ -636,8 +938,10 @@ async def extract_obj(
                             decimation_target=decimation_target, texture_size=texture_size,
                             remesh=True, remesh_band=1, remesh_project=0, use_tqdm=True,
                         )
+                        meter.end()
                     except Exception as e:
-                        if "out of memory" in str(e).lower() or "oom" in str(e).lower() or "allocate" in str(e).lower():
+                        if is_cuda_oom(e, torch):
+                            meter.end()
                             print(f"⚠ OOM detected in to_glb with remesh=True! Retrying with remesh=False (Fallback Mode)...")
                             del verts, faces, attrs, coords
                             gc.collect()
@@ -648,12 +952,14 @@ async def extract_obj(
                             attrs = state['attrs'].to(dev)
                             coords = state['coords'].to(dev)
 
+                            meter.begin("OBJ export fallback: no remesh")
                             textured_mesh = o_voxel.postprocess.to_glb(
                                 vertices=verts, faces=faces, attr_volume=attrs, coords=coords,
                                 attr_layout=state['pbr_layout'], grid_size=state['res'], aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
                                 decimation_target=decimation_target, texture_size=texture_size,
                                 remesh=False, use_tqdm=True,
                             )
+                            meter.end()
                         else:
                             raise e
 
@@ -814,17 +1120,27 @@ async def extract_obj(
                         zf.write(str(f), f.name)
 
                 shutil.rmtree(str(obj_dir), ignore_errors=True)
-                return str(zip_path)
+                return str(zip_path), meter.peak_gb
 
-            zip_path = await asyncio.get_event_loop().run_in_executor(None, do_export)
-            restore_envmaps()
+            zip_path, peak_gb = await asyncio.get_event_loop().run_in_executor(None, do_export)
 
-            return FileResponse(zip_path, media_type="application/zip", filename=Path(zip_path).name)
+            headers = {"X-Trellis-Peak-VRAM-GB": f"{peak_gb:.3f}"} if peak_gb is not None else {}
+            return FileResponse(zip_path, media_type="application/zip", filename=Path(zip_path).name, headers=headers)
 
         except Exception as e:
-            force_offload_all()
+            try:
+                force_offload_all()
+            finally:
+                _empty_cuda_cache()
+            if is_cuda_oom(e, torch):
+                try:
+                    meter.end()
+                except Exception:
+                    pass
+                detail = oom_detail(meter.stage, meter.peak_gb, profile, state.get("res"))
+                raise HTTPException(status_code=500, detail=detail) from None
             traceback.print_exc()
-            raise HTTPException(status_code=500, detail=str(e))
+            raise HTTPException(status_code=500, detail=str(e)) from None
 
 
 # ---------------------------------------------------------------------------
@@ -878,17 +1194,23 @@ async def texturing(
     seed: int = Form(11456),
     randomize_seed: bool = Form(False),
     resolution: str = Form("1024"),
+    execution_preset: str = Form(""),
     texture_size: int = Form(2048),
     tex_guidance_strength: float = Form(1.0),
     tex_guidance_rescale: float = Form(0.0),
     tex_sampling_steps: int = Form(12),
     tex_rescale_t: float = Form(3.0),
 ):
-    if tex_pipeline is None:
-        raise HTTPException(status_code=501, detail="Texturing pipeline not available")
-
     if randomize_seed:
         seed = int(np.random.randint(0, MAX_SEED))
+    profile = resolve_profile(execution_preset or DEFAULT_PROFILE_REQUEST, GPU_INFO)
+    try:
+        offload = resolve_cpu_offload(CPU_OFFLOAD_REQUEST, profile, GPU_INFO.get("total_vram_gb"))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    # The upstream re-texturing pipeline supports 512 and 1024 only. A selected
+    # 1536 generation preset therefore uses its supported 1024 texture path.
+    texture_resolution = 512 if str(resolution) == "512" else 1024
 
     session_id = str(uuid.uuid4())
     session_dir = get_session_dir(session_id)
@@ -903,39 +1225,75 @@ async def texturing(
         mesh_obj = mesh_obj.to_mesh()
 
     pil_image = load_pil_image(image)
-    pil_image = tex_pipeline.preprocess_image(pil_image)
 
     async with gpu_lock:
         try:
+            meter = VramMeter(torch, GENERATION_DEVICE)
             def do_texture():
-                import torch
-                import gc
-                with torch.no_grad():
+                global tex_pipeline
+                output = None
+                prepared_image = None
+                stage_open = False
+                try:
                     force_offload_all()
-                    tex_pipeline._device = GENERATION_DEVICE
-
-                    output = tex_pipeline.run(
-                        mesh_obj, pil_image, seed=seed, preprocess_image=False,
-                        tex_slat_sampler_params={"steps": tex_sampling_steps, "guidance_strength": tex_guidance_strength, "guidance_rescale": tex_guidance_rescale, "rescale_t": tex_rescale_t},
-                        resolution=int(resolution), texture_size=texture_size,
-                    )
-
+                    if tex_pipeline is None:
+                        print("Loading re-texturing components (sharing generation texture models)...", flush=True)
+                        tex_pipeline = load_texturing_pipeline_shared()
+                    meter.begin("Re-texturing model preparation")
+                    stage_open = True
+                    configure_pipeline_for_job(tex_pipeline, offload)
+                    meter.end()
+                    stage_open = False
+                    with torch.no_grad():
+                        meter.begin("Re-texturing: conditioning, texture sampling, decode and bake")
+                        stage_open = True
+                        prepared_image = tex_pipeline.preprocess_image(pil_image)
+                        output = tex_pipeline.run(
+                            mesh_obj, prepared_image, seed=seed, preprocess_image=False,
+                            tex_slat_sampler_params={"steps": tex_sampling_steps, "guidance_strength": tex_guidance_strength, "guidance_rescale": tex_guidance_rescale, "rescale_t": tex_rescale_t},
+                            resolution=texture_resolution, texture_size=texture_size,
+                        )
+                        meter.end()
+                        stage_open = False
                     ts = make_timestamp()
                     glb_path = session_dir / f"textured_{ts}.glb"
                     output.export(str(glb_path))
 
-                    del output
-                    gc.collect()
-                    torch.cuda.empty_cache()
+                    return str(glb_path), meter.peak_gb
+                except Exception as exc:
+                    if is_cuda_oom(exc, torch):
+                        if stage_open and meter.available:
+                            try:
+                                meter.end()
+                            except Exception:
+                                pass
+                        detail = oom_detail(meter.stage, meter.peak_gb, profile, texture_resolution)
+                        try:
+                            exc.__traceback__ = None
+                            exc.__context__ = None
+                        except Exception:
+                            pass
+                        raise GenerationOOMError(detail) from None
+                    raise
+                finally:
+                    output = prepared_image = None
+                    try:
+                        force_offload_all()
+                    except Exception as cleanup_error:
+                        print(f"[VRAM] Re-texturing cleanup warning: {cleanup_error}", flush=True)
+                    _empty_cuda_cache()
 
-                force_offload_all()
-                return str(glb_path)
-
-            glb_path = await asyncio.get_event_loop().run_in_executor(None, do_texture)
-            return FileResponse(glb_path, media_type="model/gltf-binary", filename=Path(glb_path).name)
+            glb_path, peak_gb = await asyncio.get_event_loop().run_in_executor(None, do_texture)
+            headers = {"X-Trellis-Peak-VRAM-GB": f"{peak_gb:.3f}"} if peak_gb is not None else {}
+            return FileResponse(glb_path, media_type="model/gltf-binary", filename=Path(glb_path).name, headers=headers)
 
         except Exception as e:
-            force_offload_all()
+            if isinstance(e, GenerationOOMError):
+                raise HTTPException(status_code=500, detail=str(e)) from None
+            try:
+                force_offload_all()
+            finally:
+                _empty_cuda_cache()
             traceback.print_exc()
             raise HTTPException(status_code=500, detail=str(e))
 
