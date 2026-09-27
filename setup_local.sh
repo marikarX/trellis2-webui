@@ -169,7 +169,9 @@ new = '''try:
         except Exception as e:
             print(f'Warning: Background removal model failed to load: {e}')
             pipeline.rembg_model = None'''
-if old in src:
+if 'Warning: Background removal model failed to load' in src:
+    print(f'  rembg already optional in $pyfile')
+elif old in src:
     open(f, 'w').write(src.replace(old, new))
     print(f'  Patched rembg in $pyfile to be optional')
 "
@@ -510,7 +512,7 @@ fi
 # ---------------------------------------------------------------------------
 echo "[8/8] Verifying installation..."
 
-python -c "
+PYTHONPATH="${TRELLIS_DIR}:${PYTHONPATH:-}" python -c "
 import torch
 print(f'  PyTorch: {torch.__version__}, CUDA: {torch.version.cuda}, GPUs: {torch.cuda.device_count()}')
 try:
