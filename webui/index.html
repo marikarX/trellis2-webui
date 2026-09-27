@@ -19,6 +19,10 @@
         <h1>TRELLIS<span class="accent">.2</span></h1>
         <span class="header-badge">Image → 3D</span>
       </div>
+      <div class="runtime-status" id="runtimeStatus" aria-live="polite">
+        <strong id="gpuSummary">Detecting GPU…</strong>
+        <span id="runtimeRecommendation">Loading runtime details</span>
+      </div>
     </header>
 
     <!-- ====== Tab Bar ====== -->
@@ -58,39 +62,15 @@
 
         <!-- Multi-View Upload -->
         <section class="tab-content" data-tab="multiview">
-          <h2 class="panel-title">Multi-View Images <span class="count-badge" id="mvCount">0 / 6</span></h2>
-          <div class="mv-grid" id="mvGrid">
-            <div class="mv-slot" data-index="0">
-              <input type="file" accept="image/*" hidden />
-              <div class="mv-placeholder"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" opacity="0.4"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg><span>View 1</span></div>
-              <img class="mv-preview" alt="" />
-            </div>
-            <div class="mv-slot" data-index="1">
-              <input type="file" accept="image/*" hidden />
-              <div class="mv-placeholder"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" opacity="0.4"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg><span>View 2</span></div>
-              <img class="mv-preview" alt="" />
-            </div>
-            <div class="mv-slot" data-index="2">
-              <input type="file" accept="image/*" hidden />
-              <div class="mv-placeholder"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" opacity="0.4"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg><span>View 3</span></div>
-              <img class="mv-preview" alt="" />
-            </div>
-            <div class="mv-slot" data-index="3">
-              <input type="file" accept="image/*" hidden />
-              <div class="mv-placeholder"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" opacity="0.4"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg><span>View 4</span></div>
-              <img class="mv-preview" alt="" />
-            </div>
-            <div class="mv-slot" data-index="4">
-              <input type="file" accept="image/*" hidden />
-              <div class="mv-placeholder"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" opacity="0.4"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg><span>View 5</span></div>
-              <img class="mv-preview" alt="" />
-            </div>
-            <div class="mv-slot" data-index="5">
-              <input type="file" accept="image/*" hidden />
-              <div class="mv-placeholder"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" opacity="0.4"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg><span>View 6</span></div>
-              <img class="mv-preview" alt="" />
-            </div>
+          <h2 class="panel-title">Multi-View Images</h2>
+          <input type="file" id="mvFileInput" accept="image/*" multiple hidden />
+          <div class="mv-upload-tools">
+            <button type="button" class="btn-secondary" id="mvAddButton">Choose images</button>
+            <span class="count-badge" id="mvCount">0 / 6 views loaded</span>
           </div>
+          <div class="mv-drop-zone" id="mvDropZone">Drop 2–6 images here, or choose files above</div>
+          <div class="mv-grid" id="mvGrid"></div>
+          <p class="mv-label-note">View labels help organize your references. TRELLIS.2 does not use camera labels during generation.</p>
         </section>
 
         <!-- Re-Texturing Upload -->
@@ -120,21 +100,21 @@
           <div class="setting-row">
             <label>Quality Preset</label>
             <div class="preset-group" id="presetGroup">
-              <button class="preset-btn" data-preset="fast" title="12 steps, lower guidance — fastest generation">
+              <button class="preset-btn active" data-preset="16gb-fast" title="512 geometry, 12 steps, sequential view conditioning">
                 <span class="preset-icon">⚡</span>
-                <span class="preset-label">Fast</span>
+                <span class="preset-label">16GB Fast</span>
               </button>
-              <button class="preset-btn active" data-preset="balanced" title="20 steps, balanced guidance — recommended">
+              <button class="preset-btn" data-preset="16gb-quality" title="512 geometry, more sampling steps, CPU offload">
                 <span class="preset-icon">⚖️</span>
-                <span class="preset-label">Balanced</span>
+                <span class="preset-label">16GB Quality</span>
               </button>
-              <button class="preset-btn" data-preset="high" title="30 steps, higher guidance — detailed output">
+              <button class="preset-btn" data-preset="24gb-high" title="1024 cascade, intended for 24GB or larger GPUs">
                 <span class="preset-icon">✨</span>
-                <span class="preset-label">HQ</span>
+                <span class="preset-label">24GB+ High</span>
               </button>
-              <button class="preset-btn" data-preset="max" title="50 steps, maximum quality — slow but best results">
+              <button class="preset-btn" data-preset="maximum" title="1536 cascade, experimental and may require more than 16GB VRAM">
                 <span class="preset-icon">💎</span>
-                <span class="preset-label">Max</span>
+                <span class="preset-label">Maximum</span>
               </button>
             </div>
           </div>
@@ -157,10 +137,11 @@
           <div class="setting-row">
             <label>Resolution</label>
             <div class="radio-group" id="resolutionGroup">
-              <button class="radio-btn" data-value="512">512</button>
-              <button class="radio-btn active" data-value="1024">1024</button>
+              <button class="radio-btn active" data-value="512">512</button>
+              <button class="radio-btn" data-value="1024">1024</button>
               <button class="radio-btn" data-value="1536">1536</button>
             </div>
+            <span class="upload-hint" id="resolutionWarning">The 16 GB presets use 512 geometry. Higher resolutions are experimental on 16 GB.</span>
           </div>
 
           <div class="setting-row">
@@ -272,6 +253,7 @@
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
           <span>Generate</span>
         </button>
+        <div class="generation-stats" id="generationStats" hidden></div>
 
         <!-- Examples -->
         <div class="examples-section" id="examplesSection">

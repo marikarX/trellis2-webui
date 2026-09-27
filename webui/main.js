@@ -7,6 +7,9 @@ const state = {
   activeTab: 'single',
   singleImage: null,       // File
   multiviewImages: [null, null, null, null, null, null],
+  multiviewLabels: ['Front', 'Front Left', 'Left', 'Back', 'Back Right', 'Right'],
+  multiviewPreviewUrls: [null, null, null, null, null, null],
+  pendingViewIndex: null,
   meshFile: null,
   texImage: null,
   sessionId: null,
@@ -16,38 +19,45 @@ const state = {
   glbUrl: null,
   generating: false,
   extracting: false,
-  currentPreset: 'balanced',
+  currentPreset: '16gb-fast',
+  presetTouched: false,
+  runtimeInfo: null,
   currentSurface: 'hard',
 };
 
 // -------- Preset Definitions --------
 // Each preset defines base values; surface type adds guidance offsets.
 const PRESETS = {
-  fast: {
+  '16gb-fast': {
     ss_gs: 7.5, ss_gr: 0.7, ss_steps: 12, ss_rt: 5.0,
     shape_gs: 7.5, shape_gr: 0.5, shape_steps: 12, shape_rt: 3.0,
     tex_gs: 1.0, tex_gr: 0.0, tex_steps: 12, tex_rt: 3.0,
-    decimation: 500000, texSize: 2048,
+    decimation: 500000, texSize: 2048, resolution: '512',
   },
-  balanced: {
+  '16gb-quality': {
     ss_gs: 8.0, ss_gr: 0.7, ss_steps: 20, ss_rt: 5.0,
     shape_gs: 8.0, shape_gr: 0.5, shape_steps: 20, shape_rt: 3.0,
     tex_gs: 2.0, tex_gr: 0.1, tex_steps: 20, tex_rt: 3.0,
-    decimation: 800000, texSize: 2048,
+    decimation: 800000, texSize: 2048, resolution: '512',
   },
-  high: {
+  '24gb-high': {
     ss_gs: 8.0, ss_gr: 0.7, ss_steps: 30, ss_rt: 5.0,
     shape_gs: 8.5, shape_gr: 0.5, shape_steps: 30, shape_rt: 4.0,
     tex_gs: 2.5, tex_gr: 0.15, tex_steps: 30, tex_rt: 4.0,
-    decimation: 800000, texSize: 4096,
+    decimation: 800000, texSize: 4096, resolution: '1024',
   },
-  max: {
+  maximum: {
     ss_gs: 8.0, ss_gr: 0.7, ss_steps: 50, ss_rt: 6.0,
     shape_gs: 8.5, shape_gr: 0.5, shape_steps: 50, shape_rt: 6.0,
     tex_gs: 2.5, tex_gr: 0.2, tex_steps: 50, tex_rt: 6.0,
-    decimation: 1000000, texSize: 4096,
+    decimation: 1000000, texSize: 4096, resolution: '1536',
   },
 };
+
+const VIEW_LABELS = [
+  'Front', 'Front Left', 'Left', 'Back Left', 'Back', 'Back Right',
+  'Right', 'Front Right', 'Top', 'Bottom', 'Custom',
+];
 
 // Surface type guidance offsets (added to preset base)
 const SURFACE_OFFSETS = {
@@ -76,7 +86,55 @@ document.addEventListener('DOMContentLoaded', () => {
   initExtractButton();
   loadExamples();
   applyPreset(); // Set initial slider values from default preset
+  loadRuntimeInfo();
 });
+
+async function loadRuntimeInfo() {
+  try {
+    const response = await fetch('/api/runtime');
+    if (!response.ok) throw new Error('Runtime details unavailable');
+    const info = await response.json();
+    state.runtimeInfo = info;
+    const gpuSummary = $('#gpuSummary');
+    const recommendation = $('#runtimeRecommendation');
+    if (!info.cuda_available) {
+      gpuSummary.textContent = 'CUDA GPU unavailable';
+      recommendation.textContent = 'The UI remains available; GPU generation needs a CUDA runtime.';
+    } else {
+      const vram = Number(info.total_vram_gb).toFixed(1);
+      gpuSummary.textContent = `GPU: ${info.gpu_name} · ${vram} GB VRAM`;
+      const recommended = prettyPreset(info.recommended_preset);
+      const selected = info.default_preset === info.recommended_preset
+        ? ''
+        : ` · selected: ${prettyPreset(info.default_preset)}`;
+      const runtimeWarnings = (info.warnings || []).join(' ');
+      recommendation.textContent = `Recommended: ${recommended}${selected} · CPU offload ${info.cpu_offload ? 'on' : 'off'} · ${info.attention_backend}${runtimeWarnings ? ` · ${runtimeWarnings}` : ''}`;
+      recommendation.classList.toggle('warning-text', Boolean(runtimeWarnings));
+    }
+    $('#runtimeStatus').title = [
+      info.precision,
+      `BF16: ${info.bf16_supported ? 'supported' : 'not reported'}`,
+      ...(info.warnings || []).filter(Boolean),
+    ].join('\n');
+    if (!state.presetTouched && PRESETS[info.default_preset]) {
+      state.currentPreset = info.default_preset;
+      $$('[data-preset]').forEach((button) => button.classList.toggle('active', button.dataset.preset === state.currentPreset));
+      applyPreset();
+    }
+  } catch (error) {
+    $('#gpuSummary').textContent = 'GPU status unavailable';
+    $('#runtimeRecommendation').textContent = 'Check the server runtime log for CUDA details.';
+  }
+}
+
+function prettyPreset(preset) {
+  return ({
+    '16gb-fast': '16GB Fast',
+    '16gb-quality': '16GB Quality',
+    '24gb-high': '24GB+ High',
+    maximum: 'Maximum',
+  })[preset] || preset || '16GB Fast';
+}
 
 // ============================================================
 // TABS
@@ -129,36 +187,105 @@ function initSingleUpload() {
 // MULTI-VIEW UPLOAD
 // ============================================================
 function initMultiViewUpload() {
-  const slots = $$('.mv-slot');
-  slots.forEach((slot) => {
-    const idx = parseInt(slot.dataset.index);
-    const input = slot.querySelector('input[type=file]');
-    const preview = slot.querySelector('.mv-preview');
+  const grid = $('#mvGrid');
+  const input = $('#mvFileInput');
+  const dropZone = $('#mvDropZone');
+  const addButton = $('#mvAddButton');
+  const labelOptions = VIEW_LABELS.map((label) => `<option value="${label}">${label}</option>`).join('');
 
-    slot.addEventListener('click', () => input.click());
-    slot.addEventListener('dragover', (e) => { e.preventDefault(); slot.classList.add('dragover'); });
+  for (let idx = 0; idx < 6; idx += 1) {
+    const slot = document.createElement('div');
+    slot.className = 'mv-slot';
+    slot.dataset.index = String(idx);
+    slot.innerHTML = `
+      <div class="mv-placeholder"><span>Drop or select View ${idx + 1}</span></div>
+      <img class="mv-preview" alt="View ${idx + 1}" />
+      <select class="mv-label" aria-label="View ${idx + 1} label">${labelOptions}</select>
+      <button type="button" class="mv-remove" aria-label="Remove view ${idx + 1}" hidden>×</button>
+    `;
+    const selector = slot.querySelector('.mv-label');
+    const remove = slot.querySelector('.mv-remove');
+    selector.value = state.multiviewLabels[idx];
+    selector.addEventListener('click', (event) => event.stopPropagation());
+    selector.addEventListener('change', () => { state.multiviewLabels[idx] = selector.value; });
+    remove.addEventListener('click', (event) => {
+      event.stopPropagation();
+      clearMvSlot(idx, slot);
+    });
+
+    slot.addEventListener('click', () => {
+      state.pendingViewIndex = idx;
+      input.click();
+    });
+    slot.addEventListener('dragover', (event) => { event.preventDefault(); slot.classList.add('dragover'); });
     slot.addEventListener('dragleave', () => slot.classList.remove('dragover'));
-    slot.addEventListener('drop', (e) => {
-      e.preventDefault();
+    slot.addEventListener('drop', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
       slot.classList.remove('dragover');
-      if (e.dataTransfer.files.length) handleMvFile(e.dataTransfer.files[0], idx, slot, preview);
+      assignMvFiles(event.dataTransfer.files, idx);
     });
-    input.addEventListener('change', () => {
-      if (input.files.length) handleMvFile(input.files[0], idx, slot, preview);
-    });
-  });
-
-  function handleMvFile(file, idx, slot, preview) {
-    state.multiviewImages[idx] = file;
-    preview.src = URL.createObjectURL(file);
-    slot.classList.add('has-image');
-    updateMvCount();
+    grid.appendChild(slot);
   }
+
+  addButton.addEventListener('click', () => {
+    state.pendingViewIndex = null;
+    input.click();
+  });
+  input.addEventListener('change', () => {
+    assignMvFiles(input.files, state.pendingViewIndex);
+    state.pendingViewIndex = null;
+    input.value = '';
+  });
+  dropZone.addEventListener('dragover', (event) => { event.preventDefault(); dropZone.classList.add('dragover'); });
+  dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
+  dropZone.addEventListener('drop', (event) => {
+    event.preventDefault();
+    dropZone.classList.remove('dragover');
+    state.pendingViewIndex = null;
+    assignMvFiles(event.dataTransfer.files, null);
+  });
 }
 
 function updateMvCount() {
   const count = state.multiviewImages.filter((f) => f !== null).length;
-  $('#mvCount').textContent = `${count} / 6`;
+  $('#mvCount').textContent = `${count} / 6 views loaded`;
+  $('#mvDropZone').textContent = count >= 6
+    ? 'All 6 view slots are filled. Remove a view to replace it.'
+    : `Drop ${count ? 'more ' : ''}images here (${count} / 6 loaded), or choose files above`;
+}
+
+function assignMvFiles(fileList, startIndex = null) {
+  const files = Array.from(fileList || []).filter((file) => file.type.startsWith('image/'));
+  if (!files.length) return;
+  let target = Number.isInteger(startIndex) ? startIndex : state.multiviewImages.findIndex((file) => file === null);
+  let accepted = 0;
+  files.forEach((file) => {
+    while (target < 6 && state.multiviewImages[target] !== null && target !== startIndex) target += 1;
+    if (target < 0) target = state.multiviewImages.findIndex((item) => item === null);
+    if (target < 0 || target >= 6) return;
+    const slot = $(`.mv-slot[data-index="${target}"]`);
+    if (state.multiviewPreviewUrls[target]) URL.revokeObjectURL(state.multiviewPreviewUrls[target]);
+    state.multiviewImages[target] = file;
+    state.multiviewPreviewUrls[target] = URL.createObjectURL(file);
+    slot.querySelector('.mv-preview').src = state.multiviewPreviewUrls[target];
+    slot.querySelector('.mv-remove').hidden = false;
+    slot.classList.add('has-image');
+    accepted += 1;
+    target += 1;
+  });
+  updateMvCount();
+  if (accepted < files.length) alert('The multi-view workflow supports up to 6 images.');
+}
+
+function clearMvSlot(index, slot) {
+  if (state.multiviewPreviewUrls[index]) URL.revokeObjectURL(state.multiviewPreviewUrls[index]);
+  state.multiviewPreviewUrls[index] = null;
+  state.multiviewImages[index] = null;
+  slot.querySelector('.mv-preview').removeAttribute('src');
+  slot.querySelector('.mv-remove').hidden = true;
+  slot.classList.remove('has-image');
+  updateMvCount();
 }
 
 // ============================================================
@@ -221,6 +348,7 @@ function initRadioGroups() {
       btn.addEventListener('click', () => {
         group.querySelectorAll('.radio-btn').forEach((b) => b.classList.remove('active'));
         btn.classList.add('active');
+        if (group.id === 'resolutionGroup') updateResolutionWarning();
       });
     });
   });
@@ -280,11 +408,12 @@ function initSliders() {
 // ============================================================
 function initPresets() {
   $$('.preset-btn').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      $$('.preset-btn').forEach((b) => b.classList.remove('active'));
-      btn.classList.add('active');
-      state.currentPreset = btn.dataset.preset;
-      applyPreset();
+      btn.addEventListener('click', () => {
+        $$('.preset-btn').forEach((b) => b.classList.remove('active'));
+        btn.classList.add('active');
+        state.currentPreset = btn.dataset.preset;
+        state.presetTouched = true;
+        applyPreset();
     });
   });
 }
@@ -340,6 +469,23 @@ function applyPreset() {
     return v >= 1000000 ? `${(v / 1000000).toFixed(1)}M` : `${Math.round(v / 1000)}K`;
   });
   setSlider('textureSize', 'texsize_val', preset.texSize);
+  $$('#resolutionGroup .radio-btn').forEach((button) => {
+    button.classList.toggle('active', button.dataset.value === preset.resolution);
+  });
+  updateResolutionWarning();
+}
+
+function updateResolutionWarning() {
+  const resolution = $('#resolutionGroup .radio-btn.active')?.dataset.value || '512';
+  const lowVram = (state.runtimeInfo?.total_vram_gb ?? 16) < 24;
+  const warning = $('#resolutionWarning');
+  if (lowVram && resolution !== '512') {
+    warning.textContent = `${resolution} geometry is experimental below 24 GB VRAM and may OOM. Use a 16GB preset for the 512 mode.`;
+    warning.classList.add('warning-text');
+  } else {
+    warning.textContent = 'The 16GB presets use 512 geometry. Higher resolutions are experimental below 24GB.';
+    warning.classList.remove('warning-text');
+  }
 }
 
 // ============================================================
@@ -357,7 +503,8 @@ function initGenerateButton() {
 
 function getSettings() {
   return {
-    resolution: $('.radio-btn.active')?.dataset.value || '1024',
+    resolution: $('#resolutionGroup .radio-btn.active')?.dataset.value || '512',
+    execution_preset: state.currentPreset,
     seed: parseInt($('#seedInput').value) || 0,
     randomize_seed: $('#randomizeSeed').checked,
     ss_guidance_strength: parseFloat($('#ss_gs').value),
@@ -388,6 +535,18 @@ function setGenerating(isGenerating) {
     // Reset progress
     updateProgress(0, 'Ready');
   }
+}
+
+function showGenerationStats(data) {
+  const stats = $('#generationStats');
+  const peak = data.peak_vram_gb != null && Number.isFinite(Number(data.peak_vram_gb))
+    ? `${Number(data.peak_vram_gb).toFixed(2)} GB peak allocated`
+    : 'Peak VRAM unavailable';
+  const views = Number(data.num_views || 1);
+  const resolutionLabel = data.resolution_label || `${data.resolution} geometry`;
+  stats.textContent = `${prettyPreset(data.preset)} · ${resolutionLabel} · ${views} view${views === 1 ? '' : 's'} · ${peak}`;
+  if (data.warning) stats.textContent += ` — ${data.warning}`;
+  stats.hidden = false;
 }
 
 function updateProgress(percent, stage) {
@@ -444,6 +603,7 @@ async function generateSingle() {
     state.sessionId = data.session_id;
     state.previews = data.previews;
     state.glbUrl = null;
+    showGenerationStats(data);
     showPreviews();
   } catch (err) {
     stopPolling();
@@ -454,7 +614,9 @@ async function generateSingle() {
 }
 
 async function generateMultiView() {
-  const images = state.multiviewImages.filter((f) => f !== null);
+  const images = state.multiviewImages
+    .map((file, index) => ({ file, index, label: state.multiviewLabels[index] }))
+    .filter((entry) => entry.file !== null);
   if (images.length < 2) {
     alert('Please upload at least 2 images for multi-view.');
     return;
@@ -466,7 +628,10 @@ async function generateMultiView() {
   const settings = getSettings();
   const formData = new FormData();
   formData.append('task_id', taskId);
-  images.forEach((file, i) => formData.append(`image_${i}`, file));
+  images.forEach(({ file, index, label }) => {
+    formData.append(`image_${index}`, file);
+    formData.append(`view_label_${index}`, label);
+  });
   Object.entries(settings).forEach(([k, v]) => formData.append(k, String(v)));
 
   // Start SSE progress polling immediately
@@ -484,6 +649,7 @@ async function generateMultiView() {
     state.sessionId = data.session_id;
     state.previews = data.previews;
     state.glbUrl = null;
+    showGenerationStats(data);
     showPreviews();
   } catch (err) {
     stopPolling();
@@ -507,7 +673,8 @@ async function generateTexturing() {
   formData.append('image', state.texImage);
   formData.append('seed', String(settings.seed || 11456));
   formData.append('randomize_seed', 'false');  // Stage 2: fixed seed by default
-  formData.append('resolution', settings.resolution);
+  formData.append('resolution', settings.resolution === '512' ? '512' : '1024');
+  formData.append('execution_preset', settings.execution_preset);
   formData.append('texture_size', $('#textureSize').value);
   formData.append('tex_guidance_strength', String(settings.tex_guidance_strength));
   formData.append('tex_guidance_rescale', String(settings.tex_guidance_rescale));
@@ -527,6 +694,13 @@ async function generateTexturing() {
     state.glbUrl = URL.createObjectURL(blob);
     state.previews = null;
     state.sessionId = null;
+    const texturePeak = res.headers.get('X-Trellis-Peak-VRAM-GB');
+    showGenerationStats({
+      preset: settings.execution_preset,
+      resolution_label: `${settings.resolution === '512' ? 512 : 1024} texture resolution`,
+      num_views: 1,
+      peak_vram_gb: texturePeak,
+    });
     showGlbViewer();
   } catch (err) {
     alert(`Error: ${err.message}`);
