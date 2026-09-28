@@ -2,13 +2,18 @@ import os
 os.environ.setdefault('OPENCV_IO_ENABLE_OPENEXR', '1')
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-# Auto deliberately resolves to PyTorch SDPA. The fork's setup applies a small
-# sparse-attention adapter because upstream does not expose SDPA for VarLenTensor.
+# Auto prefers installed Flash Attention for variable-length sparse sequences;
+# the padded PyTorch SDPA adapter is the dependency-free fallback.
 _requested_attention = os.environ.get(
     "TRELLIS_ATTENTION_BACKEND", os.environ.get("ATTN_BACKEND", "auto")
 ).strip().lower()
+REQUESTED_ATTENTION_BACKEND = _requested_attention
 if _requested_attention == "auto":
-    _requested_attention = "sdpa"
+    try:
+        __import__("flash_attn")
+        _requested_attention = "flash_attn"
+    except Exception:
+        _requested_attention = "sdpa"
 if _requested_attention not in {"sdpa", "flash_attn", "flash_attn_3", "xformers"}:
     raise RuntimeError("TRELLIS_ATTENTION_BACKEND must be auto, sdpa, flash_attn, flash_attn_3, or xformers")
 ATTENTION_BACKEND = _requested_attention
@@ -81,6 +86,24 @@ RECOMMENDED_PROFILE = recommend_profile(GPU_INFO.get("total_vram_gb"))
 DEFAULT_PROFILE_REQUEST = os.environ.get("TRELLIS_EXECUTION_PRESET", "auto")
 CPU_OFFLOAD_REQUEST = os.environ.get("TRELLIS_CPU_OFFLOAD", "auto")
 
+# Upstream loads both 512 and 1024 shape/texture flow networks into host RAM.
+# The 16 GB path never calls the 1024 models, and loading those unused 1.3B
+# networks consumed the WSL RAM/swap headroom needed to decode a 512 result.
+# Keep the complete upstream set on 24 GB+ devices; low-memory devices load only
+# components required by the supported 512 path.
+_ALL_IMAGE_MODEL_NAMES = tuple(Trellis2ImageTo3DPipeline.model_names_to_load)
+_LOW_MEMORY_UNUSED_MODELS = frozenset({
+    "shape_slat_flow_model_1024",
+    "tex_slat_flow_model_1024",
+})
+_LOAD_HIGH_RESOLUTION_MODELS = (
+    GPU_INFO.get("total_vram_gb") is not None
+    and GPU_INFO["total_vram_gb"] >= 24
+)
+_LOW_MEMORY_IMAGE_MODEL_NAMES = tuple(
+    name for name in _ALL_IMAGE_MODEL_NAMES if name not in _LOW_MEMORY_UNUSED_MODELS
+)
+
 # Global pipeline references (initialized on startup)
 pipeline: Trellis2ImageTo3DPipeline = None  # type: ignore
 tex_pipeline: Trellis2TexturingPipeline = None  # type: ignore
@@ -138,6 +161,47 @@ def force_offload_all():
         print(f"[VRAM] Offload cleanup warnings: {'; '.join(cleanup_errors)}", flush=True)
 
 
+def load_pipeline_model(model_name: str):
+    """Load one upstream component on demand for the low-memory profile."""
+    if model_name in pipeline.models:
+        return pipeline.models[model_name]
+    if model_name not in _ALL_IMAGE_MODEL_NAMES:
+        raise KeyError(f"Unknown TRELLIS.2 model component: {model_name}")
+    if not _LOAD_HIGH_RESOLUTION_MODELS and model_name not in _LOW_MEMORY_IMAGE_MODEL_NAMES:
+        raise RuntimeError(f"{model_name} is unavailable in the 512-only low-memory profile.")
+
+    relative_path = pipeline._pretrained_args["models"][model_name]
+    try:
+        model = trellis_models.from_pretrained(str(Path(MODEL_PATH) / relative_path))
+    except Exception:
+        # Match the upstream loader's fallback for components stored in a
+        # separate Hugging Face repository (for example the sparse decoder).
+        model = trellis_models.from_pretrained(relative_path)
+    model.eval()
+    pipeline.models[model_name] = model
+    print(f"[MODEL] Loaded stage component: {model_name}", flush=True)
+    return model
+
+
+def release_pipeline_models(model_names):
+    """Drop low-memory stage weights instead of retaining a second CPU copy."""
+    if _LOAD_HIGH_RESOLUTION_MODELS or pipeline is None:
+        return
+    removed = [pipeline.models.pop(name) for name in model_names if name in pipeline.models]
+    if not removed:
+        return
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize(GENERATION_DEVICE)
+    except Exception:
+        pass
+    removed.clear()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    print(f"[MODEL] Released stage component(s): {', '.join(model_names)}", flush=True)
+
+
 def restore_envmaps():
     """Restores envmaps to the GPU for rendering."""
     for v in envmap.values():
@@ -170,14 +234,20 @@ def load_texturing_pipeline_shared():
         from huggingface_hub import hf_hub_download
         texturing_config_path = Path(hf_hub_download(MODEL_PATH, "texturing_pipeline.json"))
     args = json.loads(texturing_config_path.read_text(encoding="utf-8"))["args"]
+    load_pipeline_model("tex_slat_decoder")
+    load_pipeline_model("tex_slat_flow_model_512")
+    if _LOAD_HIGH_RESOLUTION_MODELS:
+        load_pipeline_model("tex_slat_flow_model_1024")
+
     shape_encoder_path = args["models"]["shape_slat_encoder"]
     shape_encoder = trellis_models.from_pretrained(f"{MODEL_PATH}/{shape_encoder_path}")
     models = {
         "shape_slat_encoder": shape_encoder,
         "tex_slat_decoder": pipeline.models["tex_slat_decoder"],
         "tex_slat_flow_model_512": pipeline.models["tex_slat_flow_model_512"],
-        "tex_slat_flow_model_1024": pipeline.models["tex_slat_flow_model_1024"],
     }
+    if "tex_slat_flow_model_1024" in pipeline.models:
+        models["tex_slat_flow_model_1024"] = pipeline.models["tex_slat_flow_model_1024"]
     sampler_cfg = args["tex_slat_sampler"]
     return Trellis2TexturingPipeline(
         models=models,
@@ -278,6 +348,13 @@ async def startup():
     global pipeline, tex_pipeline, envmap
     TMP_DIR.mkdir(exist_ok=True)
 
+    if _LOAD_HIGH_RESOLUTION_MODELS:
+        Trellis2ImageTo3DPipeline.model_names_to_load = list(_ALL_IMAGE_MODEL_NAMES)
+        print(f"[MODEL] Loading the full 512/1024 component set for {GPU_INFO['total_vram_gb']:.1f} GB VRAM")
+    else:
+        Trellis2ImageTo3DPipeline.model_names_to_load = []
+        print("[MODEL] Low-memory mode: 512 generation components load one stage at a time")
+
     print(f"Loading model from: {MODEL_PATH}")
     pipeline = Trellis2ImageTo3DPipeline.from_pretrained(MODEL_PATH)
     pipeline.low_vram = True
@@ -351,18 +428,32 @@ async def runtime_info():
     except ValueError as exc:
         offload = True
         warnings.append(f"Invalid TRELLIS_CPU_OFFLOAD was ignored: {exc}")
+    if not _LOAD_HIGH_RESOLUTION_MODELS:
+        offload = True
+        warnings.append("CPU offload is required and enforced by the low-memory model-loading path.")
     total_vram = current_gpu_info.get("total_vram_gb")
     if total_vram is not None and total_vram < 12:
         warnings.append("Below 12 GB VRAM is experimental; the application will still launch.")
     if total_vram is not None and total_vram < 24:
-        warnings.append("16 GB inference has not been benchmarked in this checkout; 512 is the conservative default.")
+        warnings.append("Low-memory mode is limited to the tested 512 component path; see the README benchmark matrix for RTX 4080 results.")
+    if not _LOAD_HIGH_RESOLUTION_MODELS:
+        warnings.append("This runtime loads only 512 generation components to reduce host RAM use; 1024/1536 are unavailable.")
+    attention_labels = {
+        "sdpa": "PyTorch SDPA",
+        "flash_attn": "Flash Attention",
+        "flash_attn_3": "Flash Attention 3",
+        "xformers": "xFormers",
+    }
+    selected_attention = attention_labels.get(ATTENTION_BACKEND, ATTENTION_BACKEND)
+    if REQUESTED_ATTENTION_BACKEND == "auto":
+        selected_attention = f"Auto ({selected_attention})"
     return {
         **current_gpu_info,
         "recommended_preset": recommended_profile,
         "default_preset": profile.key,
         "default_geometry_resolution": profile.resolution,
         "cpu_offload": offload,
-        "attention_backend": "Auto (PyTorch SDPA)" if ATTENTION_BACKEND == "sdpa" else ATTENTION_BACKEND,
+        "attention_backend": selected_attention,
         "precision": "Checkpoint-defined (upstream TRELLIS.2 4B uses BF16 flow weights and FP16 decoders)",
         "warnings": warnings,
     }
@@ -398,7 +489,11 @@ def run_generation(
 ) -> tuple[dict, dict, float | None, list[dict[str, Any]]]:
     """Run explicit TRELLIS.2 stages so their model/tensor lifetimes are visible."""
     global pipeline
-    offload = resolve_cpu_offload(CPU_OFFLOAD_REQUEST, profile, GPU_INFO.get("total_vram_gb"))
+    offload = (
+        True
+        if not _LOAD_HIGH_RESOLUTION_MODELS
+        else resolve_cpu_offload(CPU_OFFLOAD_REQUEST, profile, GPU_INFO.get("total_vram_gb"))
+    )
     pipeline_type = {"512": "512", "1024": "1024_cascade", "1536": "1536_cascade"}.get(resolution)
     if pipeline_type is None:
         raise ValueError("Resolution must be 512, 1024, or 1536.")
@@ -479,13 +574,23 @@ def run_generation(
             begin_stage("Sparse structure sampling", 26)
             cond_512_gpu = _condition_to_device(cond_512_cpu)
             sparse_resolution = {"512": 32, "1024": 64, "1024_cascade": 32, "1536_cascade": 32}[pipeline_type]
+            load_pipeline_model("sparse_structure_flow_model")
+            load_pipeline_model("sparse_structure_decoder")
             coords = pipeline.sample_sparse_structure(cond_512_gpu, sparse_resolution, 1, ss_params)
+            release_pipeline_models(("sparse_structure_flow_model", "sparse_structure_decoder"))
             cond_512_gpu = None
             end_stage()
             if offload:
                 _empty_cuda_cache()
 
             begin_stage("Shape generation", 40)
+            shape_model_names = (
+                ("shape_slat_flow_model_512",)
+                if pipeline_type == "512"
+                else ("shape_slat_flow_model_512", "shape_slat_flow_model_1024")
+            )
+            for model_name in shape_model_names:
+                load_pipeline_model(model_name)
             if pipeline_type == "512":
                 cond_512_gpu = _condition_to_device(cond_512_cpu)
                 shape_slat = pipeline.sample_shape_slat(
@@ -512,6 +617,7 @@ def run_generation(
                     coords,
                     shape_params,
                 )
+            release_pipeline_models(shape_model_names)
             cond_512_gpu = cond_1024_gpu = None
             coords = None
             del coords
@@ -524,9 +630,11 @@ def run_generation(
             tex_cond_cpu = cond_512_cpu if use_512_material_model else cond_1024_cpu
             tex_cond_gpu = _condition_to_device(tex_cond_cpu)
             tex_model_name = "tex_slat_flow_model_512" if use_512_material_model else "tex_slat_flow_model_1024"
+            load_pipeline_model(tex_model_name)
             tex_slat = pipeline.sample_tex_slat(
                 tex_cond_gpu, pipeline.models[tex_model_name], shape_slat, tex_params
             )
+            release_pipeline_models((tex_model_name,))
             tex_cond_gpu = None
             cond_512_cpu = cond_1024_cpu = None
             del cond_512_cpu, cond_1024_cpu
@@ -542,13 +650,17 @@ def run_generation(
             # Decode shape first, release its latent, then decode materials.
             # The only duplicated glue below mirrors upstream decode_latent().
             begin_stage("Decoding geometry and PBR voxels", 75)
+            load_pipeline_model("shape_slat_decoder")
             meshes, subs = pipeline.decode_shape_slat(shape_slat, output_resolution)
+            release_pipeline_models(("shape_slat_decoder",))
             shape_slat = None
             del shape_slat
             if offload:
                 _empty_cuda_cache()
                 tex_slat = tex_slat.to(GENERATION_DEVICE)
+            load_pipeline_model("tex_slat_decoder")
             tex_voxels = pipeline.decode_tex_slat(tex_slat, subs)
+            release_pipeline_models(("tex_slat_decoder",))
             tex_slat = None
             subs = None
             del tex_slat, subs
@@ -628,6 +740,10 @@ def run_generation(
         shape_mesh = voxel = None
         state = previews = None
         try:
+            if not _LOAD_HIGH_RESOLUTION_MODELS:
+                # On a failed low-memory stage, dropping CUDA/CPU parameters is
+                # safer than copying an incomplete model back to host RAM.
+                release_pipeline_models(tuple(pipeline.models))
             force_offload_all()
         except Exception as cleanup_error:
             print(f"[VRAM] Cleanup warning: {cleanup_error}", flush=True)
@@ -651,6 +767,11 @@ def _profile_and_resolution(preset_key: str, requested_resolution: str):
     resolution = str(requested_resolution or profile.resolution)
     if resolution not in {"512", "1024", "1536"}:
         raise HTTPException(status_code=422, detail="Resolution must be 512, 1024, or 1536.")
+    if resolution != "512" and not _LOAD_HIGH_RESOLUTION_MODELS:
+        raise HTTPException(
+            status_code=422,
+            detail="This low-memory runtime loads only 512 generation components. 1024/1536 require a 24 GB+ GPU preset.",
+        )
     warning = profile.warning
     total_vram = GPU_INFO.get("total_vram_gb")
     if total_vram is not None and total_vram < 24 and resolution != "512":
@@ -664,6 +785,11 @@ async def _start_generation(images, labels, task_id, seed, profile, resolution, 
     progress_store[task_id] = {"stage": "Starting", "step": 0, "total": 100, "done": False}
     async with gpu_lock:
         try:
+            if latent_store:
+                # The UI has no generation history; keep saved GLB files on disk
+                # but drop older CPU mesh tensors before starting another job.
+                latent_store.clear()
+                gc.collect()
             result = await asyncio.get_event_loop().run_in_executor(
                 None,
                 lambda: run_generation(images, labels, task_id, seed, profile, resolution, *params),
@@ -1237,12 +1363,24 @@ async def texturing(
         seed = int(np.random.randint(0, MAX_SEED))
     profile = resolve_profile(execution_preset or DEFAULT_PROFILE_REQUEST, GPU_INFO)
     try:
-        offload = resolve_cpu_offload(CPU_OFFLOAD_REQUEST, profile, GPU_INFO.get("total_vram_gb"))
+        offload = (
+            True
+            if not _LOAD_HIGH_RESOLUTION_MODELS
+            else resolve_cpu_offload(CPU_OFFLOAD_REQUEST, profile, GPU_INFO.get("total_vram_gb"))
+        )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from None
     # The upstream re-texturing pipeline supports 512 and 1024 only. A selected
     # 1536 generation preset therefore uses its supported 1024 texture path.
-    texture_resolution = 512 if str(resolution) == "512" else 1024
+    requested_texture_resolution = str(resolution)
+    texture_resolution = (
+        512 if not _LOAD_HIGH_RESOLUTION_MODELS or requested_texture_resolution == "512" else 1024
+    )
+    texture_resolution_warning = (
+        "Low-memory mode uses 512 texture resolution; 1024 texture weights are not loaded."
+        if not _LOAD_HIGH_RESOLUTION_MODELS and requested_texture_resolution != "512"
+        else None
+    )
 
     session_id = str(uuid.uuid4())
     session_dir = get_session_dir(session_id)
@@ -1313,10 +1451,19 @@ async def texturing(
                         force_offload_all()
                     except Exception as cleanup_error:
                         print(f"[VRAM] Re-texturing cleanup warning: {cleanup_error}", flush=True)
+                    if not _LOAD_HIGH_RESOLUTION_MODELS:
+                        tex_pipeline = None
+                        release_pipeline_models((
+                            "tex_slat_decoder",
+                            "tex_slat_flow_model_512",
+                            "tex_slat_flow_model_1024",
+                        ))
                     _empty_cuda_cache()
 
             glb_path, peak_gb = await asyncio.get_event_loop().run_in_executor(None, do_texture)
             headers = {"X-Trellis-Peak-VRAM-GB": f"{peak_gb:.3f}"} if peak_gb is not None else {}
+            if texture_resolution_warning:
+                headers["X-Trellis-Resolution-Warning"] = texture_resolution_warning
             return FileResponse(glb_path, media_type="model/gltf-binary", filename=Path(glb_path).name, headers=headers)
 
         except Exception as e:

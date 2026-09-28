@@ -1,9 +1,9 @@
-"""
-Patch: Add 'sdpa' (Scaled Dot-Product Attention) backend
-to trellis2/modules/sparse/attention/full_attn.py
+"""Patch sparse-attention source to support PyTorch SDPA.
 
-This is needed for environments without flash_attn (e.g., CUDA 13.2 / B50/B200).
-Applied by vastai_setup.sh during provisioning.
+This is needed for environments without flash_attn. Upstream's attention
+implementation has an SDPA branch, but its environment selector must also
+accept 'sdpa' or it silently keeps its Flash Attention default. Applied by
+setup_local.sh and vastai_setup.sh during provisioning.
 """
 import sys
 import os
@@ -73,22 +73,40 @@ def patch(trellis_dir):
     target = os.path.join(trellis_dir, 'trellis2', 'modules', 'sparse', 'attention', 'full_attn.py')
     if not os.path.exists(target):
         print(f"  [SKIP] {target} not found")
-        return
+    else:
+        src = open(target).read()
+        if "config.ATTN == 'sdpa'" in src:
+            print("  [SKIP] full_attn.py SDPA branch already present")
+        else:
+            # Insert before the else/raise ValueError branch
+            marker = "    else:\n        raise ValueError(f\"Unknown attention module: {config.ATTN}\")"
+            if marker not in src:
+                print("  [WARN] Could not find insertion point in full_attn.py")
+            else:
+                src = src.replace(marker, SDPA_BLOCK + "\n" + marker)
+                open(target, 'w').write(src)
+                print("  Patched full_attn.py with sdpa backend")
 
-    src = open(target).read()
-    if "'sdpa'" in src:
-        print("  [SKIP] sdpa branch already present")
+    # Current upstream contains the SDPA implementation but omits it from the
+    # environment allowlist, making ATTN_BACKEND=sdpa silently use flash_attn.
+    config_target = os.path.join(trellis_dir, 'trellis2', 'modules', 'sparse', 'config.py')
+    if not os.path.exists(config_target):
+        print(f"  [SKIP] {config_target} not found")
         return
-
-    # Insert before the else/raise ValueError branch
-    marker = "    else:\n        raise ValueError(f\"Unknown attention module: {config.ATTN}\")"
-    if marker not in src:
-        print("  [WARN] Could not find insertion point in full_attn.py")
-        return
-
-    src = src.replace(marker, SDPA_BLOCK + "\n" + marker)
-    open(target, 'w').write(src)
-    print("  Patched full_attn.py with sdpa backend")
+    config_src = open(config_target).read()
+    old_backends = "['xformers', 'flash_attn', 'flash_attn_3']"
+    new_backends = "['xformers', 'flash_attn', 'flash_attn_3', 'sdpa']"
+    if any(
+        "env_sparse_attn_backend in [" in line and "'sdpa'" in line
+        for line in config_src.splitlines()
+    ):
+        print("  [SKIP] config.py already accepts sdpa")
+    elif old_backends in config_src:
+        config_src = config_src.replace(old_backends, new_backends)
+        open(config_target, 'w').write(config_src)
+        print("  Patched config.py to accept sdpa")
+    else:
+        print("  [WARN] Could not find sparse attention backend allowlist in config.py")
 
 
 if __name__ == '__main__':

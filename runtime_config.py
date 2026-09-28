@@ -28,7 +28,7 @@ PROFILES: dict[str, ExecutionProfile] = {
     ),
     "16gb-quality": ExecutionProfile(
         "16gb-quality", "16GB Quality", "512", 20, 800_000, 2048,
-        "512 geometry with more sampling steps; 16 GB fit is not yet benchmark-verified.",
+        "512 geometry with more sampling steps; single-view fit was measured on RTX 4080 16 GB. Multi-view Quality has not been measured.",
     ),
     "24gb-high": ExecutionProfile(
         "24gb-high", "24GB+ High", "1024", 30, 800_000, 4096,

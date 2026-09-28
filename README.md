@@ -39,31 +39,33 @@ See [vastai_template.md](vastai_template.md) for full deployment instructions.
 
 ## RTX 4080 / 16 GB VRAM
 
-The WebUI now has four execution profiles. On GPUs below 24 GB, startup recommends **16GB Fast** and enables CPU offload automatically. The app still starts below 12 GB; generation is marked experimental.
+The WebUI now has four execution profiles. On GPUs below 24 GB, startup recommends **16GB Fast** and uses staged model loading with CPU-backed conditioning. The app still starts below 12 GB; generation is marked experimental.
 
 | Profile | Geometry | Sampling | Offload in auto mode | Guidance |
 |---|---:|---:|---|---|
 | **16GB Fast** | 512 | 12 steps | On | Conservative starting point for 12–23 GB GPUs |
-| **16GB Quality** | 512 | 20 steps | On | More sampling at the same geometry resolution |
+| **16GB Quality** | 512 | 20 steps | On | Single-view fit measured; multi-view Quality is untested |
 | **24GB+ High** | 1024 cascade | 30 steps | Off at 24 GB+ | High-memory path; 1024 may still need more memory |
 | **Maximum** | 1536 cascade | 50 steps | Off at 24 GB+ | Experimental; more than 16 GB may be required |
 
-**No 16 GB inference benchmark has been completed in this checkout.** The 512 profiles are conservative settings, not a claim that the RTX 4080 fit is already measured. The benchmark matrix below must be run on the target installation before describing a mode as validated. In particular, treat 1024/1536 and 4096 texture baking as experimental on 16 GB.
+**Measured on an RTX 4080 16 GB under WSL2:** 16GB Fast completed at 512 with 1, 2, 4, and 6 reference images, including GLB export. 16GB Quality completed at 512 with one image. These runs verify completion and allocator peaks for the test inputs; they do not establish same-object multi-view fidelity or guarantee identical memory behavior with other drivers, inputs, or concurrent GPU workloads. 1024/1536 generation is not loaded on GPUs below 24 GB. The 24GB+ and Maximum profiles, and 4096 texture baking, remain untested here.
 
 ### Execution and memory behavior
 
-- TRELLIS.2 components are loaded from their checkpoint files into CPU memory at startup. The WebUI does not move the full pipeline to CUDA for 16 GB profiles.
+- In the 16 GB path, DINOv3 stays backed by CPU memory between view encodes and generation components are loaded from checkpoints only for their active stage. On 24 GB+ devices, upstream's full image-to-3D model set remains available for the high-memory path.
 - For low-memory runs, the image conditioner processes each reference image one at a time. Its tokens are copied to CPU and concatenated there, so all 2–6 views remain part of the condition without holding a six-image encoder batch on the GPU. The final condition and downstream cross-attention still grow with view count; serial encoding reduces conditioner peak memory but does not guarantee every 6-view workload fits.
 - View labels (Front, Left, Top, etc.) are organizational metadata. The released TRELLIS.2 checkpoint consumes image tokens, not camera labels.
 - The fork-side multi-view adaptation concatenates each view's DINO patch tokens into the cross-attention sequence. It retains all images but is not an upstream camera-aware interface; output quality and scaling for 2–6 views still require inference validation.
-- Sparse structure, shape, material, decoder, preview, and export work are separate stages. Upstream's low-VRAM model calls move their active network to CUDA and return it to CPU; the WebUI releases stage intermediates and clears the CUDA cache at stage boundaries.
+- On GPUs below 24 GB, the WebUI starts the upstream pipeline without preloading its full set of shape/material components into host RAM. It loads the needed 512 component from the checkpoint for each stage, then drops that component, collects it, and clears the CUDA cache after its last use. The image conditioner remains available on CPU and is moved to CUDA only while encoding each view. This reload-from-checkpoint policy uses disk I/O to avoid retaining unused 1024 flow weights in CPU RAM; high-memory startup preserves upstream's full model set.
+- Sparse structure, shape, material, decoder, preview, and export work are separate stages. Stage tensors are released when their last downstream consumer finishes. The sampled material latent is copied to CPU while shape decoding runs, then copied back for texture decoding.
 - The re-texturing pipeline loads lazily and reuses the image pipeline's texture flow and decoder weights. This avoids loading a second copy of those weights into CPU RAM.
 - The official 4B pipeline config names BF16 flow checkpoints and FP16 decoders. The app preserves checkpoint precision; it does not cast all tensors to a different dtype. The UI reports CUDA BF16 capability.
-- Attention defaults to **Auto → PyTorch SDPA**. The fork's sparse-attention adapter enables SDPA for TRELLIS.2's variable-length sparse attention. `flash_attn`, `flash_attn_3`, and `xformers` can be explicitly selected only when installed and supported by that build.
-- Initial RAM guidance: **32 GB system RAM minimum; 48 GB or more recommended** for CPU-backed model weights and WSL/Linux overhead. This is a planning estimate, not a measured minimum.
+- Attention defaults to **Auto**: it uses Flash Attention when that extension imports successfully, otherwise the fork's compatibility patch enables PyTorch SDPA. This WSL installation had no importable `flash_attn` module, so Auto selected PyTorch SDPA for the measured matrix. `sdpa`, `flash_attn`, `flash_attn_3`, and `xformers` can be explicitly selected; Flash Attention 3 and xFormers require a compatible installed build.
+- Test host: **32 GiB Windows RAM**, WSL capped at **16 GiB RAM with 8 GiB swap**. The 1/2/4/6-view Fast runs and 20-step single-view Quality run completed with this configuration. An earlier all-model CPU preload was killed by WSL's system OOM at about 15.5 GiB process RSS; the current lazy-load path avoids preloading the unused 1024 flow networks. This is a tested setup, not a minimum-RAM guarantee.
 - Generation logs `[VRAM]` allocated, reserved, and peak allocated memory at stage boundaries. The response also includes a stage list and peak allocated VRAM; the WebUI displays the peak after generation. CUDA OOMs return the failing stage and a lower-profile suggestion. GLB/OBJ export has one explicit no-remesh fallback.
+- Automatic removal via `briaai/RMBG-2.0` is gated. If access is unavailable, the WebUI logs a non-fatal warning and continues; use references with transparent masks or clean backgrounds when automatic background removal is unavailable.
 
-The following is the intended/code-inspected residency for low-VRAM jobs, not a measured peak profile:
+The following describes the low-VRAM residency path. The peak table below records measured PyTorch allocator peaks for the test machine:
 
 | Stage | Components and large tensors on CUDA |
 |---|---|
@@ -74,7 +76,7 @@ The following is the intended/code-inspected residency for low-VRAM jobs, not a 
 | Decode / preview | `shape_slat_decoder` then `tex_slat_decoder`; texture SLat is copied back for texture decode. Meshes/voxel attributes and preview renderer work remain on CUDA. |
 | GLB/OBJ export | Inference networks stay on CPU; O-Voxel/CuMesh, vertex data, PBR volume, UV rasterization, and texture-bake scratch buffers use CUDA. |
 
-High-memory generation profiles preserve the resident image-to-3D path: all models in that pipeline are moved to CUDA for the job. Exact peak stage and how much 2–6 views change downstream VRAM are **unknown until inference is measured**. Code inspection says sequential conditioning avoids a multi-image DINO batch, while the final cross-attention condition grows with the number of views. Sparse tensor caches are cleared when the texture latent is staged to CPU; other intermediates are released at their last stage use.
+High-memory generation profiles preserve the resident image-to-3D path: all models in that pipeline are moved to CUDA for the job. They were not tested on this 16 GB machine. In the measured 512 runs, sequential conditioning kept the conditioner peak at 1.37 GiB for each tested view count; final cross-attention still consumes all view tokens, and the sparse/shape/material stages peaked at 2.62–2.89 GiB allocated. Sparse tensor caches are cleared when the texture latent is staged to CPU; other intermediates are released at their last stage use.
 
 ### Configuration
 
@@ -88,6 +90,23 @@ High-memory generation profiles preserve the resident image-to-3D path: all mode
 
 The resolution control can override a profile. On GPUs below 24 GB, selecting 1024 or 1536 shows an experimental warning; the backend logs the selected resolution and returns a useful error if CUDA runs out of memory. Camera labels never alter model conditioning.
 
+### Start the validated WSL installation
+
+In WSL Bash, from the installed checkout:
+
+```bash
+cd "$HOME/trellis2-runtime/trellis2-webui"
+export TRELLIS_DIR="$HOME/trellis2-runtime/TRELLIS.2"
+export CUDA_HOME=/usr/local/cuda-13.0 CUDA_PATH=/usr/local/cuda-13.0
+export LIBRARY_PATH="/usr/local/cuda-13.0/targets/x86_64-linux/lib/stubs:${LIBRARY_PATH:-}"
+export PATH="/usr/local/cuda-13.0/bin:$HOME/.local/bin:$HOME/.nvm/versions/node/v22.19.0/bin:$PATH"
+export TRELLIS_EXECUTION_PRESET=auto TRELLIS_CPU_OFFLOAD=auto
+export TRELLIS_ATTENTION_BACKEND=auto ATTN_BACKEND=sdpa SPARSE_ATTN_BACKEND=sdpa
+./run_local.sh
+```
+
+Open `http://127.0.0.1:8000/`. The startup detects the RTX 4080, selects 16GB Fast, and Auto uses SDPA on this environment because Flash Attention is unavailable.
+
 ### Benchmark and validation
 
 Start the WebUI, then run the benchmark client from another terminal. Supply one path per view; multi-view inputs must be exactly 2, 4, or 6 images.
@@ -100,31 +119,37 @@ python benchmark_vram.py --views 6 --preset 16gb-fast --image /path/to/front.png
 python benchmark_vram.py --views 1 --preset 16gb-quality --image /path/to/front.png
 ```
 
-The script calls generation and GLB export, writes the GLB under `benchmark-output/`, and prints success, selected resolution, view count, generation seconds, stage VRAM, export peak, and GLB size. Run it separately for 2, 4, and 6 views using the 16GB profile. Record results in the table before making fit claims:
+The script calls generation and GLB export, writes the GLB under `benchmark-output/`, and prints success, selected resolution, view count, generation seconds, stage VRAM, export peak, and GLB size. The following are actual runs on 2026-09-27. Peak memory is PyTorch `max_memory_allocated` for generation; export peak is the corresponding measured allocator peak from export. Times cover generation and export separately. The bundled input images are distinct examples, not multiple photographs of one object, so the multi-view cases validate the execution path and resource use rather than view-consistency quality.
 
-| Case | Result | Peak generation VRAM | Time | Resolution | Views | GLB size |
+| Case | Result | Peak generation / export VRAM | Generation / export time | Resolution | Views | GLB size |
 |---|---|---:|---:|---:|---:|---:|
-| A — 16GB Fast | Not run: model weights and PyTorch/CUDA environment were unavailable in the inspected host | — | — | 512 | 1 | — |
-| B — 16GB Fast | Not run | — | — | 512 | 2 | — |
-| C — 16GB Fast | Not run | — | — | 512 | 4 | — |
-| D — 16GB Fast | Not run | — | — | 512 | 6 | — |
-| E — highest fitting mode | Not run | — | — | — | 1 | — |
+| A — 16GB Fast | Success | 2.62 / 1.28 GiB | 56.599 / 21.742 s | 512 | 1 | 38,570,260 B |
+| B — 16GB Fast | Success | 2.82 / 1.85 GiB | 54.095 / 23.645 s | 512 | 2 | 43,151,208 B |
+| C — 16GB Fast | Success | 2.87 / 1.87 GiB | 57.621 / 24.878 s | 512 | 4 | 39,712,584 B |
+| D — 16GB Fast | Success | 2.71 / 1.67 GiB | 63.085 / 22.054 s | 512 | 6 | 38,543,632 B |
+| E — 16GB Quality | Success, single-view only | 2.81 / 1.26 GiB | 55.901 / 22.280 s | 512 | 1 | 49,826,512 B |
 
-**Current inspected host:** Windows reports an RTX 4080 and NVIDIA driver 591.86; WSL2 can see the GPU, but WSL had no PyTorch, CUDA toolkit, TRELLIS.2 weights, or DINOv3 weights, and reported about 15 GiB available RAM plus 4 GiB swap at inspection time. Therefore this checkout has no measured inference VRAM, generation time, GLB output size, or tested PyTorch/CUDA combination. The local setup script requests PyTorch 2.10.0 with CUDA 13.0; upstream's README describes PyTorch 2.6.0/CUDA 12.4 as its default path. Neither was run here.
+Auto resolved to PyTorch SDPA for all cases because the `flash_attn` package was not installed in this environment. Test A also ran with explicit `TRELLIS_ATTENTION_BACKEND=sdpa`, confirming the backend selection rather than relying only on the runtime label. Multi-view SDPA completed all 2/4/6-view cases.
+
+**Test environment:** WSL2 Ubuntu 24.04.3; Python 3.12; PyTorch 2.10.0+cu130; CUDA runtime/toolkit 13.0; Windows NVIDIA driver 591.86; RTX 4080 with 16,376 MiB reported by CUDA; BF16 supported; PyTorch SDPA attention. WSL was configured for 16 GiB RAM and 8 GiB swap on a Windows host with 32 GiB RAM. At the post-test snapshot, WSL reported 10 GiB available and 2.1 GiB swap in use. Tests were run with the local TRELLIS.2-4B and DINOv3 weights. Windows-native inference was not tested.
+
+The low-memory re-texturing endpoint also completed at 512: 3.205 GiB peak allocated, returning a 28,462,672 B GLB. `trimesh` parsed all five benchmark GLBs as one mesh with a `PBRMaterial`. Godot 4.7.2 headless imported and instantiated a generated GLB successfully. Blender 4.x was not installed on the test host, so its import remains unverified.
+
+The measured highest tested profile on this GPU is 16GB Quality at 512 with 20 sampling steps for one view. 16GB Fast was measured at 1/2/4/6 views; 16GB Quality was not tested with multiple views. The 1024/1536 options are intentionally unavailable below 24 GB in the low-memory runtime rather than being presented as 16 GB-safe. Godot 4.7.2 import was exercised; Blender 4.x import was unavailable for validation. The GLB exporter continues to use the existing upstream coordinate, scale, UV, and PBR conventions.
 
 ### Upstream integration and output compatibility
 
 The fork's local setup pins TRELLIS.2 to commit `5565d240c4a494caaf9ece7a554542b76ffa36d3`. Neither that pinned pipeline nor inspected upstream `main` defines `run_multiview`; the old WebUI endpoint called that missing method. The fork now builds the conditioning sequence in the WebUI backend and uses the upstream `sample_sparse_structure`, `sample_shape_slat[_cascade]`, `sample_tex_slat`, and decoder APIs.
 
-Setup continues to apply the fork's isolated compatibility patches: `patches/sparse_attn_sdpa.py` adds the PyTorch SDPA sparse-attention branch, `patches/dinov3_layer_compat.py` handles Transformers' DINOv3 layer layout, `patches/decode_latent_oom_fix.py` reduces retained decoder intermediates in upstream's original `run()` path, and `patches/normal_map_bake.py` adds the existing tangent-space normal-map bake to O-Voxel. The setup scripts also make background-remover loading optional when BiRefNet dependencies are unavailable. This low-VRAM generation path calls upstream stages directly, so the `decode_latent_oom_fix.py` change does not replace or wrap the new staged runner.
+Setup continues to apply the fork's isolated compatibility patches: `patches/sparse_attn_sdpa.py` adds the PyTorch SDPA sparse-attention branch and adds `sdpa` to upstream's backend allowlist, `patches/dinov3_layer_compat.py` handles Transformers' DINOv3 layer layout, `patches/decode_latent_oom_fix.py` reduces retained decoder intermediates in upstream's original `run()` path, and `patches/normal_map_bake.py` adds the existing tangent-space normal-map bake to O-Voxel. The setup scripts also make background-remover loading optional when BiRefNet dependencies are unavailable. This low-VRAM generation path calls upstream stages directly, so the `decode_latent_oom_fix.py` change does not replace or wrap the new staged runner.
 
-GLB export still uses the upstream O-Voxel `to_glb` path with the same `[-0.5, 0.5]` AABB, grid resolution, PBR attribute layout, UV baking, and coordinate conversion. The fork's normal-map patch remains applied. It does not change mesh scale, coordinate system, UV orientation, or GLB material packing, so Blender 4.x and Godot 4.x remain the intended consumers; real import validation still needs to be performed on generated files.
+GLB export still uses the upstream O-Voxel `to_glb` path with the same `[-0.5, 0.5]` AABB, grid resolution, PBR attribute layout, UV baking, and coordinate conversion. The fork's normal-map patch remains applied. It does not change mesh scale, coordinate system, UV orientation, or GLB material packing. Godot 4.7.2 import was checked; Blender 4.x import should be checked on a machine with Blender installed.
 
 ## Local Development
 
 ### Prerequisites
 
-- NVIDIA GPU; 16 GB profiles are conservative but not yet inference-validated, while 24 GB+ is recommended for high-resolution modes
+- NVIDIA GPU; 16GB Fast at 512 is inference-validated on WSL2/RTX 4080 for 1/2/4/6 views, while 24 GB+ is required to load high-resolution components in this fork
 - CUDA Toolkit 12.4+ or 13.x
 - Python 3.10+
 - Node.js 18+
