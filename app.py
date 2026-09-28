@@ -358,6 +358,12 @@ async def startup():
     print(f"Loading model from: {MODEL_PATH}")
     pipeline = Trellis2ImageTo3DPipeline.from_pretrained(MODEL_PATH)
     pipeline.low_vram = True
+    if pipeline.rembg_model is None:
+        print(
+            "[WARN] RMBG-2.0 is unavailable; opaque reference images will be used as-is "
+            "without automatic background removal.",
+            flush=True,
+        )
     tex_pipeline = None  # Construct lazily and share the texture models on first use.
     force_offload_all()
 
@@ -438,6 +444,11 @@ async def runtime_info():
         warnings.append("Low-memory mode is limited to the tested 512 component path; see the README benchmark matrix for RTX 4080 results.")
     if not _LOAD_HIGH_RESOLUTION_MODELS:
         warnings.append("This runtime loads only 512 generation components to reduce host RAM use; 1024/1536 are unavailable.")
+    if pipeline is not None and getattr(pipeline, "rembg_model", None) is None:
+        warnings.append(
+            "RMBG-2.0 is unavailable. Opaque references are accepted as-is without automatic background removal; "
+            "transparent images keep their alpha masks."
+        )
     attention_labels = {
         "sdpa": "PyTorch SDPA",
         "flash_attn": "Flash Attention",
