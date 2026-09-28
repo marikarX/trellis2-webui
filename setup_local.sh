@@ -438,7 +438,7 @@ if [ "$SKIP_MODELS" = "1" ]; then
     echo "    DINOv3       : ${DINOV3_DIR}/"
 else
     # 6a. TRELLIS.2-4B
-    if [ -d "${MODEL_DIR}" ] && [ -f "${MODEL_DIR}/config.json" ]; then
+    if [ -d "${MODEL_DIR}" ] && [ -f "${MODEL_DIR}/pipeline.json" ]; then
         echo "  TRELLIS.2-4B already downloaded."
     else
         echo "  Downloading TRELLIS.2-4B from HuggingFace (~16 GB)..."
@@ -459,7 +459,7 @@ else
 fi
 
 # 6c. Patch pipeline configs for local DINOv3 path
-if [ -f "${MODEL_DIR}/config.json" ]; then
+if [ -f "${MODEL_DIR}/pipeline.json" ]; then
     echo "  Patching pipeline configs for DINOv3 path..."
     for cfg in "${MODEL_DIR}/pipeline.json" "${MODEL_DIR}/texturing_pipeline.json"; do
         if [ -f "$cfg" ]; then
