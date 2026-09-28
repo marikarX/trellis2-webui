@@ -246,6 +246,33 @@ def render_preview_images(mesh, envmap_dict) -> dict:
 # ---------------------------------------------------------------------------
 # Startup / Shutdown
 # ---------------------------------------------------------------------------
+def read_environment_map_rgb(path: Path) -> np.ndarray:
+    """Read an HDRI with OpenCV, falling back to OpenEXR when needed.
+
+    Some OpenCV wheels are built without OpenEXR support, even when the
+    ``OPENCV_IO_ENABLE_OPENEXR`` flag is set. Keep the bundled PBR preview
+    lighting available across those builds.
+    """
+    image_bgr = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    if image_bgr is not None:
+        return cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+
+    import OpenEXR
+
+    with OpenEXR.File(str(path)) as exr_file:
+        channels = exr_file.channels()
+        if "RGB" in channels:
+            image_rgb = channels["RGB"].pixels
+        elif "RGBA" in channels:
+            image_rgb = channels["RGBA"].pixels[..., :3]
+        elif all(channel in channels for channel in ("R", "G", "B")):
+            image_rgb = np.stack([channels[channel].pixels for channel in ("R", "G", "B")], axis=-1)
+        else:
+            raise ValueError(f"No RGB channels found in environment map: {path}")
+
+    return np.ascontiguousarray(image_rgb, dtype=np.float32)
+
+
 @app.on_event("startup")
 async def startup():
     global pipeline, tex_pipeline, envmap
@@ -262,10 +289,15 @@ async def startup():
     for name in ['forest', 'sunset', 'courtyard']:
         exr_path = hdri_dir / f"{name}.exr"
         if exr_path.exists():
-            envmap_data[name] = EnvMap(torch.tensor(
-                cv2.cvtColor(cv2.imread(str(exr_path), cv2.IMREAD_UNCHANGED), cv2.COLOR_BGR2RGB),
-                dtype=torch.float32, device='cpu'
-            ))
+            try:
+                image_rgb = read_environment_map_rgb(exr_path)
+                envmap_data[name] = EnvMap(torch.from_numpy(image_rgb))
+            except Exception as exc:
+                print(f"[WARN] Could not load preview HDRI {exr_path.name}: {exc}")
+    if not envmap_data:
+        print("[WARN] No HDRI preview maps loaded; using neutral lighting for the default preview.")
+        neutral_envmap = torch.ones((512, 1024, 3), dtype=torch.float32, device="cpu")
+        envmap_data["forest"] = EnvMap(neutral_envmap)
     envmap = envmap_data
     force_offload_all()
 

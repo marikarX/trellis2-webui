@@ -14,6 +14,7 @@ dependencies = [
     "python-multipart",
     # Image / 3D processing (used directly by the app)
     "opencv-python-headless",
+    "OpenEXR>=3.3,<4",
     "trimesh",
     "pillow",
     "numpy",
